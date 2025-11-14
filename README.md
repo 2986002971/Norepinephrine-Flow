@@ -18,7 +18,7 @@ First, install `Xvfb` on your system. For Debian/Ubuntu-based systems, you can u
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y xvfb
+sudo apt-get install -y xvfb libgl1-mesa-dri libgl1-mesa-glx libosmesa6 libegl1-mesa mesa-utils
 ```
 
 Once `Xvfb` is installed, the project should automatically detect the headless environment and use a virtual display for rendering. You do not need to modify your run commands.
