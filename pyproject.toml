@@ -13,6 +13,7 @@ dependencies = [
     "wandb",
     "matplotlib",
     "moviepy",
+    "pyvirtualdisplay>=3.0",
 ]
 
 [build-system]

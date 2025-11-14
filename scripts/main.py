@@ -52,6 +52,13 @@ config_flags.DEFINE_config_file("agent", "agents/gciql.py", lock_config=False)
 
 
 def main(_):
+    # Set up display for headless rendering.
+    if "DISPLAY" not in os.environ:
+        from pyvirtualdisplay import Display
+
+        display = Display(visible=0, size=(400, 400))
+        display.start()
+
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
     setup_wandb(project="OGBench", group=FLAGS.run_group, name=exp_name)
