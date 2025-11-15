@@ -16,7 +16,6 @@ from ne_flow.models import (
     GCEncoder,
     GCValue,
     Identity,
-    LengthNormalize,
     encoder_modules,
 )
 
@@ -47,13 +46,10 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         """Computes the IQL V-function loss."""
         # Explicitly encode all states/goals first
         s_rep = self.network.select("state_encoder")(batch["observations"])
-        s_rep = jax.lax.stop_gradient(
-            s_rep
-        )  # TODO: ?Encoder is not trained through V here?
         g_rep = self.network.select("state_encoder")(batch["value_goals"])
-        g_rep = jax.lax.stop_gradient(
-            g_rep
-        )  # Goals should not provide gradients to the encoder here
+        s_rep, g_rep = jax.lax.stop_gradient(
+            (s_rep, g_rep)
+        )  # should not provide gradients to the encoder here
 
         q1, q2 = self.network.select("target_critic")(s_rep, g_rep, batch["actions"])
         q = jnp.minimum(q1, q2)
@@ -107,9 +103,8 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         """Computes the low-level actor loss using DDPG+BC."""
         # Encode states and subgoals. Gradients flow to encoder through s_rep.
         s_rep = self.network.select("state_encoder")(batch["observations"])
-        s_rep = jax.lax.stop_gradient(s_rep)
         w_rep = self.network.select("state_encoder")(batch["low_actor_goals"])
-        w_rep = jax.lax.stop_gradient(w_rep)  # Subgoal doesn't train the encoder.
+        s_rep, w_rep = jax.lax.stop_gradient((s_rep, w_rep))
 
         # --- DDPG Loss Part ---
         dist = self.network.select("low_actor")(s_rep, w_rep, params=grad_params)
@@ -126,9 +121,9 @@ class HIQL2Agent(flax.struct.PyTreeNode):
 
         actor_loss = q_loss + bc_loss
         return actor_loss, {
-            "actor_loss": actor_loss,
-            "actor_q_loss": q_loss,
-            "actor_bc_loss": bc_loss,
+            "loss": actor_loss,
+            "q_loss": q_loss,
+            "bc_loss": bc_loss,
             "q_mean": q.mean(),
         }
 
@@ -136,9 +131,8 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         """Computes the high-level actor loss using DDPG+BC."""
         # Encode states and goals. Gradients flow to encoder through s_rep.
         s_rep = self.network.select("state_encoder")(batch["observations"])
-        s_rep = jax.lax.stop_gradient(s_rep)
         g_rep = self.network.select("state_encoder")(batch["high_actor_goals"])
-        g_rep = jax.lax.stop_gradient(g_rep)
+        s_rep, g_rep = jax.lax.stop_gradient((s_rep, g_rep))
 
         # --- DDPG Loss Part ---
         dist = self.network.select("high_actor")(s_rep, g_rep, params=grad_params)
@@ -158,9 +152,9 @@ class HIQL2Agent(flax.struct.PyTreeNode):
 
         actor_loss = v_loss + bc_loss
         return actor_loss, {
-            "actor_loss": actor_loss,
-            "actor_v_loss": v_loss,
-            "actor_bc_loss": bc_loss,
+            "loss": actor_loss,
+            "v_loss": v_loss,
+            "bc_loss": bc_loss,
             "v_mean": v.mean(),
         }
 
@@ -243,15 +237,6 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         )
         w_rep = high_dist.sample(seed=high_seed)
 
-        # CRITICAL: Normalize the actor's output during inference to ensure it lies
-        # on the same hypersphere as the training targets. This is a robust practice
-        # inspired by the HIQL paper.
-        w_rep = (
-            w_rep
-            / jnp.linalg.norm(w_rep, axis=-1, keepdims=True)
-            * jnp.sqrt(w_rep.shape[-1])
-        )
-
         # 3. Low-level policy proposes an action to reach that subgoal representation
         low_dist = self.network.select("low_actor")(
             s_rep, w_rep, temperature=temperature
@@ -270,7 +255,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         action_dim = ex_actions.shape[-1]
         rep_dim = config["rep_dim"]
 
-        # --- 1. Define the Unified State Encoder with Length Normalization ---
+        # --- 1. Define the Unified State Encoder with Normalization ---
         if config["encoder"] is not None:
             # For image-based envs, we construct an encoder that first uses an
             # IMPALA-style CNN and then normalizes the output.
@@ -289,9 +274,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
                 base_encoder_cls, mlp_hidden_dims=tuple(original_mlp_dims)
             )
 
-            state_encoder_def = nn.Sequential(
-                [encoder_module_base(), LengthNormalize()]
-            )
+            state_encoder_def = nn.Sequential([encoder_module_base(), nn.LayerNorm()])
 
         else:  # For state-based envs, use a simple MLP encoder followed by normalization.
 
@@ -305,7 +288,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
                                 activate_final=False,
                                 name="EncoderMLP",
                             ),
-                            LengthNormalize(),  # CRITICAL: Add normalization layer at the end
+                            # nn.LayerNorm(),  # CRITICAL: Add normalization layer at the end
                         ]
                     )
                     return net(x)
@@ -390,10 +373,10 @@ def get_config():
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
             expectile=0.9,  # IQL expectile.
-            low_bc_alpha=3.0,  # Low-level BC coefficient in DDPG+BC.
-            high_bc_alpha=3.0,  # High-level BC coefficient in DDPG+BC.
+            low_bc_alpha=0.3,  # Low-level BC coefficient in DDPG+BC.
+            high_bc_alpha=0.3,  # High-level BC coefficient in DDPG+BC.
             subgoal_steps=25,  # Subgoal steps.
-            rep_dim=10,  # Goal representation dimension.
+            rep_dim=2,  # Goal representation dimension.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(
