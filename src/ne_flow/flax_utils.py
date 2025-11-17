@@ -104,7 +104,7 @@ class TrainState(flax.struct.PyTreeNode):
             **kwargs: Keyword arguments to pass to the model.
         """
         if params is None:
-            params = self.params
+            params = jax.lax.stop_gradient(self.params)
         variables = {"params": params}
         if method is not None:
             method_name = getattr(self.model_def, method)
