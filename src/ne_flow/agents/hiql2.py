@@ -282,7 +282,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
                 base_encoder_cls, mlp_hidden_dims=tuple(original_mlp_dims)
             )
 
-            state_encoder_def = nn.Sequential([encoder_module_base(), nn.LayerNorm()])
+            state_encoder_def = nn.Sequential([encoder_module_base(), nn.tanh])
 
         else:  # For state-based envs, use a simple MLP encoder followed by normalization.
 
@@ -296,7 +296,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
                                 activate_final=False,
                                 name="EncoderMLP",
                             ),
-                            nn.LayerNorm(),  # CRITICAL: Add normalization layer at the end
+                            nn.tanh,  # CRITICAL: Add normalization layer at the end
                         ]
                     )
                     return net(x)
@@ -334,6 +334,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         high_actor_def = GCActor(
             hidden_dims=config["actor_hidden_dims"],
             action_dim=rep_dim,  # Predicts a representation
+            tanh_squash=True,
             const_std=config["const_std"],
             gc_encoder=GCEncoder(state_encoder=Identity(), goal_encoder=Identity()),
         )
