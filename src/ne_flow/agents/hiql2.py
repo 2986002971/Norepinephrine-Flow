@@ -113,7 +113,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         # Q-value is computed for gradient ascent on the actor. NO grads to critic/encoder here.
         q1, q2 = self.network.select("critic")(s_rep, w_rep, pred_actions)
         q = jnp.minimum(q1, q2)
-        q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
+        q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q.mean()) + 1e-6)
 
         # --- BC Loss Part ---
         log_prob = dist.log_prob(batch["actions"])
@@ -141,7 +141,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         # V-value is computed for gradient ascent. NO grads to value_fn/encoder here.
         # We evaluate the proposed subgoal representation's value.
         v = self.network.select("value")(pred_w_rep, g_rep)
-        v_loss = -v.mean() / jax.lax.stop_gradient(jnp.abs(v).mean() + 1e-6)
+        v_loss = -v.mean() / jax.lax.stop_gradient(jnp.abs(v.mean()) + 1e-6)
 
         # --- BC Loss Part ---
         # The BC target is the representation of the actual k-step future state.
@@ -285,10 +285,10 @@ class HIQL2Agent(flax.struct.PyTreeNode):
                         [
                             MLP(
                                 hidden_dims=(*config["value_hidden_dims"], rep_dim),
-                                activate_final=False,
+                                activate_final=True,
                                 name="EncoderMLP",
                             ),
-                            # nn.LayerNorm(),  # CRITICAL: Add normalization layer at the end
+                            nn.LayerNorm(),  # CRITICAL: Add normalization layer at the end
                         ]
                     )
                     return net(x)
@@ -373,8 +373,8 @@ def get_config():
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
             expectile=0.9,  # IQL expectile.
-            low_bc_alpha=0.3,  # Low-level BC coefficient in DDPG+BC.
-            high_bc_alpha=0.3,  # High-level BC coefficient in DDPG+BC.
+            low_bc_alpha=0.01,  # Low-level BC coefficient in DDPG+BC.
+            high_bc_alpha=0.01,  # High-level BC coefficient in DDPG+BC.
             subgoal_steps=25,  # Subgoal steps.
             rep_dim=2,  # Goal representation dimension.
             const_std=True,  # Whether to use constant standard deviation for the actor.
