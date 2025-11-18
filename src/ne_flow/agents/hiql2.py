@@ -58,16 +58,22 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         s_rep_grad = self.network.select("state_encoder")(
             batch["observations"], params=grad_params
         )
-        v = self.network.select("value")(s_rep_grad, g_rep, params=grad_params)
+        v1, v2 = self.network.select("value")(s_rep_grad, g_rep, params=grad_params)
+
+        adv1 = q - v1
+        adv2 = q - v2
 
         # Loss uses target Q and current V for stability.
-        value_loss = self.expectile_loss(q - v, q - v, self.config["expectile"]).mean()
+        value_loss1 = self.expectile_loss(adv1, adv1, self.config["expectile"]).mean()
+        value_loss2 = self.expectile_loss(adv2, adv2, self.config["expectile"]).mean()
+        value_loss = value_loss1 + value_loss2
 
+        v_min = jnp.minimum(v1, v2)
         return value_loss, {
             "value_loss": value_loss,
-            "v_mean": v.mean(),
-            "v_max": v.max(),
-            "v_min": v.min(),
+            "v_mean": v_min.mean(),
+            "v_max": v_min.max(),
+            "v_min": v_min.min(),
         }
 
     def critic_loss(self, batch, grad_params):
@@ -81,7 +87,8 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         s_next_rep, g_rep = jax.lax.stop_gradient((s_next_rep, g_rep))
 
         # TD target comes from the V-function.
-        next_v = self.network.select("value")(s_next_rep, g_rep)
+        next_v1, next_v2 = self.network.select("value")(s_next_rep, g_rep)
+        next_v = 0.5 * (next_v1 + next_v2)
         target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_v
 
         # Critic's encoder is Identity, so it takes reps directly.
@@ -113,7 +120,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         # Q-value is computed for gradient ascent on the actor. NO grads to critic/encoder here.
         q1, q2 = self.network.select("critic")(s_rep, w_rep, pred_actions)
         q = jnp.minimum(q1, q2)
-        q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q.mean()) + 1e-6)
+        q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
 
         # --- BC Loss Part ---
         log_prob = dist.log_prob(batch["actions"])
@@ -140,8 +147,9 @@ class HIQL2Agent(flax.struct.PyTreeNode):
 
         # V-value is computed for gradient ascent. NO grads to value_fn/encoder here.
         # We evaluate the proposed subgoal representation's value.
-        v = self.network.select("value")(pred_w_rep, g_rep)
-        v_loss = -v.mean() / jax.lax.stop_gradient(jnp.abs(v.mean()) + 1e-6)
+        v1, v2 = self.network.select("value")(pred_w_rep, g_rep)
+        v = jnp.minimum(v1, v2)
+        v_loss = -v.mean() / jax.lax.stop_gradient(jnp.abs(v).mean() + 1e-6)
 
         # --- BC Loss Part ---
         # The BC target is the representation of the actual k-step future state.
@@ -285,7 +293,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
                         [
                             MLP(
                                 hidden_dims=(*config["value_hidden_dims"], rep_dim),
-                                activate_final=True,
+                                activate_final=False,
                                 name="EncoderMLP",
                             ),
                             nn.LayerNorm(),  # CRITICAL: Add normalization layer at the end
@@ -302,7 +310,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         value_def = GCValue(
             hidden_dims=config["value_hidden_dims"],
             layer_norm=config["layer_norm"],
-            # Critical: Use Identity since we provide reps manually
+            ensemble=True,  # Twin V
             gc_encoder=GCEncoder(state_encoder=Identity(), goal_encoder=Identity()),
         )
 
@@ -373,10 +381,10 @@ def get_config():
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
             expectile=0.9,  # IQL expectile.
-            low_bc_alpha=0.01,  # Low-level BC coefficient in DDPG+BC.
+            low_bc_alpha=0.1,  # Low-level BC coefficient in DDPG+BC.
             high_bc_alpha=0.01,  # High-level BC coefficient in DDPG+BC.
             subgoal_steps=25,  # Subgoal steps.
-            rep_dim=2,  # Goal representation dimension.
+            rep_dim=10,  # Goal representation dimension.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(
