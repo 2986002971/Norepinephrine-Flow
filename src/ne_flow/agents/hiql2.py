@@ -59,7 +59,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         value_loss2 = self.expectile_loss(adv2, adv2, self.config["expectile"]).mean()
         value_loss = value_loss1 + value_loss2
 
-        v_statis = jnp.minimum(v1, v2)
+        v_statis = (v1 + v2) / 2
         return value_loss, {
             "value_loss": value_loss,
             "v_mean": v_statis.mean(),
@@ -75,9 +75,7 @@ class HIQL2Agent(flax.struct.PyTreeNode):
             batch["next_observations"], batch["value_goals"]
         )
         next_v = (next_v1 + next_v2) / 2.0
-        target_q = batch["rewards"] + self.config["discount"] * batch[
-            "masks"
-        ] * jax.lax.stop_gradient(next_v)
+        target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_v
 
         # Compute current Q-values. Gradients flow through Q-network.
         q1, q2 = self.network.select("critic")(
@@ -114,11 +112,10 @@ class HIQL2Agent(flax.struct.PyTreeNode):
 
         # --- 2. Advantage-Weighted BC Loss ---
         # 计算数据集动作的 Q 值 (Q(s, a_data))
-        # 注意：这里不需要梯度流回 Critic，因为我们只把 Critic 当评估器用
         q1_data, q2_data = self.network.select("critic")(
             batch["observations"], batch["low_actor_goals"], batch["actions"]
         )
-        q_data = jnp.minimum(q1_data, q2_data)
+        q_data = (q1_data + q2_data) / 2.0
 
         # 计算当前状态的 V 值 (V(s))
         v1, v2 = self.network.select("value")(
