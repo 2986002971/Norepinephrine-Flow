@@ -1,9 +1,7 @@
 import copy
-import functools
 from typing import Any
 
 import flax
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import ml_collections
@@ -11,11 +9,9 @@ import optax
 
 from ne_flow.flax_utils import ModuleDict, TrainState, nonpytree_field
 from ne_flow.models import (
-    MLP,
     GCActor,
     GCEncoder,
     GCValue,
-    Identity,
     encoder_modules,
 )
 
@@ -44,56 +40,51 @@ class HIQL2Agent(flax.struct.PyTreeNode):
 
     def value_loss(self, batch, grad_params):
         """Computes the IQL V-function loss."""
-        # Explicitly encode all states/goals first
-        s_rep = self.network.select("state_encoder")(batch["observations"])
-        g_rep = self.network.select("state_encoder")(batch["value_goals"])
-        s_rep, g_rep = jax.lax.stop_gradient(
-            (s_rep, g_rep)
-        )  # should not provide gradients to the encoder here
-
-        q1, q2 = self.network.select("target_critic")(s_rep, g_rep, batch["actions"])
-        q = jnp.minimum(q1, q2)
-
-        # Encoder is trained through the 's_rep' input to the value function.
-        s_rep_grad = self.network.select("state_encoder")(
-            batch["observations"], params=grad_params
+        # Get target Q-value from the target critic network (no gradients).
+        q1_t, q2_t = self.network.select("target_critic")(
+            batch["observations"], batch["value_goals"], batch["actions"]
         )
-        v1, v2 = self.network.select("value")(s_rep_grad, g_rep, params=grad_params)
+        q_t = jnp.minimum(q1_t, q2_t)
 
-        adv1 = q - v1
-        adv2 = q - v2
+        # Compute current V-value. Gradients flow through V-network.
+        # N.B.: Using ensemble for V-function as explored in the new source code.
+        v1, v2 = self.network.select("value")(
+            batch["observations"], batch["value_goals"], params=grad_params
+        )
 
-        # Loss uses target Q and current V for stability.
+        # Compute expectile loss for both V-functions.
+        adv1 = q_t - v1
+        adv2 = q_t - v2
         value_loss1 = self.expectile_loss(adv1, adv1, self.config["expectile"]).mean()
         value_loss2 = self.expectile_loss(adv2, adv2, self.config["expectile"]).mean()
         value_loss = value_loss1 + value_loss2
 
-        v_min = jnp.minimum(v1, v2)
+        v_statis = jnp.minimum(v1, v2)
         return value_loss, {
             "value_loss": value_loss,
-            "v_mean": v_min.mean(),
-            "v_max": v_min.max(),
-            "v_min": v_min.min(),
+            "v_mean": v_statis.mean(),
+            "v_max": v_statis.max(),
+            "v_min": v_statis.min(),
         }
 
     def critic_loss(self, batch, grad_params):
         """Computes the IQL Q-function (critic) loss."""
-        # Explicitly encode. Gradients flow through encoders for s and s_next.
-        s_rep = self.network.select("state_encoder")(
-            batch["observations"], params=grad_params
+        # Compute TD target using the current (non-target) V-function.
+        # Average the two V-functions for a more stable target.
+        next_v1, next_v2 = self.network.select("value")(
+            batch["next_observations"], batch["value_goals"]
         )
-        s_next_rep = self.network.select("state_encoder")(batch["next_observations"])
-        g_rep = self.network.select("state_encoder")(batch["value_goals"])
-        s_next_rep, g_rep = jax.lax.stop_gradient((s_next_rep, g_rep))
+        next_v = (next_v1 + next_v2) / 2.0
+        target_q = batch["rewards"] + self.config["discount"] * batch[
+            "masks"
+        ] * jax.lax.stop_gradient(next_v)
 
-        # TD target comes from the V-function.
-        next_v1, next_v2 = self.network.select("value")(s_next_rep, g_rep)
-        next_v = 0.5 * (next_v1 + next_v2)
-        target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_v
-
-        # Critic's encoder is Identity, so it takes reps directly.
+        # Compute current Q-values. Gradients flow through Q-network.
         q1, q2 = self.network.select("critic")(
-            s_rep, g_rep, batch["actions"], params=grad_params
+            batch["observations"],
+            batch["value_goals"],
+            batch["actions"],
+            params=grad_params,
         )
         critic_loss = ((q1 - target_q) ** 2 + (q2 - target_q) ** 2).mean()
 
@@ -106,64 +97,116 @@ class HIQL2Agent(flax.struct.PyTreeNode):
 
     # --- 2. Hierarchical Policy Extraction (in latent space) ---
 
-    def low_actor_loss(self, batch, grad_params, rng=None):
+    def low_actor_loss(self, batch, grad_params):
         """Computes the low-level actor loss using DDPG+BC."""
-        # Encode states and subgoals. Gradients flow to encoder through s_rep.
-        s_rep = self.network.select("state_encoder")(batch["observations"])
-        w_rep = self.network.select("state_encoder")(batch["low_actor_goals"])
-        s_rep, w_rep = jax.lax.stop_gradient((s_rep, w_rep))
-
-        # --- DDPG Loss Part ---
-        dist = self.network.select("low_actor")(s_rep, w_rep, params=grad_params)
+        # --- 1. DDPG Loss (Gradient Ascent through Actor) ---
+        dist = self.network.select("low_actor")(
+            batch["observations"], batch["low_actor_goals"], params=grad_params
+        )
         pred_actions = jnp.clip(dist.mode(), -1, 1)
 
-        # Q-value is computed for gradient ascent on the actor. NO grads to critic/encoder here.
-        q1, q2 = self.network.select("critic")(s_rep, w_rep, pred_actions)
+        # NOTE: The critic's target is the subgoal 'w_k'.
+        q1, q2 = self.network.select("critic")(
+            batch["observations"], batch["low_actor_goals"], pred_actions
+        )
         q = jnp.minimum(q1, q2)
         q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
 
-        # --- BC Loss Part ---
-        log_prob = dist.log_prob(batch["actions"])
-        bc_loss = -(self.config["low_bc_alpha"] * log_prob).mean()
+        # --- 2. Advantage-Weighted BC Loss ---
+        # 计算数据集动作的 Q 值 (Q(s, a_data))
+        # 注意：这里不需要梯度流回 Critic，因为我们只把 Critic 当评估器用
+        q1_data, q2_data = self.network.select("critic")(
+            batch["observations"], batch["low_actor_goals"], batch["actions"]
+        )
+        q_data = jnp.minimum(q1_data, q2_data)
 
-        actor_loss = q_loss + bc_loss
+        # 计算当前状态的 V 值 (V(s))
+        v1, v2 = self.network.select("value")(
+            batch["observations"], batch["low_actor_goals"]
+        )
+        v = (v1 + v2) / 2.0
+
+        # 计算优势 A = Q(s, a_data) - V(s)
+        adv = q_data - v
+
+        # 计算 AWR 权重: w = exp(A / temperature)
+        # 使用 stop_gradient 确保只更新 Actor，不更新产生 A 的 Critic/Value
+        weight = jnp.exp(
+            adv * self.config["low_awr_temperature"]
+        )  # 建议 temperature 设为 0.1 ~ 10 之间，即 alpha
+        weight = jnp.minimum(weight, 100.0)  # 裁剪以防数值爆炸
+        weight = jax.lax.stop_gradient(weight)
+
+        log_prob = dist.log_prob(batch["actions"])
+
+        # 加权 BC Loss
+        bc_loss = -(weight * log_prob).mean()
+
+        # 总 Loss: DDPG项 + 加权BC项
+        # 注意：通常使用了加权BC后，DDPG项的系数可以适当调小，或者 BC 的系数(low_bc_alpha)可以稍微调大
+        actor_loss = q_loss + self.config["low_bc_alpha"] * bc_loss
         return actor_loss, {
             "loss": actor_loss,
             "q_loss": q_loss,
             "bc_loss": bc_loss,
             "q_mean": q.mean(),
+            "adv_mean": adv.mean(),
+            "weight_mean": weight.mean(),
         }
 
-    def high_actor_loss(self, batch, grad_params, rng=None):
-        """Computes the high-level actor loss using DDPG+BC."""
-        # Encode states and goals. Gradients flow to encoder through s_rep.
-        s_rep = self.network.select("state_encoder")(batch["observations"])
-        g_rep = self.network.select("state_encoder")(batch["high_actor_goals"])
-        s_rep, g_rep = jax.lax.stop_gradient((s_rep, g_rep))
+    def high_actor_loss(self, batch, grad_params):
+        """Computes the high-level actor loss using DDPG + Advantage-Weighted BC."""
 
-        # --- DDPG Loss Part ---
-        dist = self.network.select("high_actor")(s_rep, g_rep, params=grad_params)
+        # --- 1. DDPG Loss ---
+        dist = self.network.select("high_actor")(
+            batch["observations"], batch["high_actor_goals"], params=grad_params
+        )
         pred_w_rep = dist.mode()
 
-        # V-value is computed for gradient ascent. NO grads to value_fn/encoder here.
-        # We evaluate the proposed subgoal representation's value.
-        v1, v2 = self.network.select("value")(pred_w_rep, g_rep)
-        v = jnp.minimum(v1, v2)
-        v_loss = -v.mean() / jax.lax.stop_gradient(jnp.abs(v).mean() + 1e-6)
+        # 评估 Actor 生成的子目标的价值
+        v1_pred, v2_pred = self.network.select("value")(
+            pred_w_rep, batch["high_actor_goals"]
+        )
+        v_pred = jnp.minimum(v1_pred, v2_pred)
+        v_loss = -v_pred.mean() / jax.lax.stop_gradient(jnp.abs(v_pred).mean() + 1e-6)
 
-        # --- BC Loss Part ---
-        # The BC target is the representation of the actual k-step future state.
-        target_w_rep = self.network.select("state_encoder")(batch["high_actor_targets"])
-        target_w_rep = jax.lax.stop_gradient(target_w_rep)
-        log_prob = dist.log_prob(target_w_rep)
-        bc_loss = -(self.config["high_bc_alpha"] * log_prob).mean()
+        # --- 2. Advantage-Weighted BC Loss ---
+        # 这里的 "Action" 是数据集中的真实子目标 (high_actor_targets)
+        # 我们需要评估这个真实子目标好不好。
 
-        actor_loss = v_loss + bc_loss
+        # 数据集子目标的价值 V(s_next, g)
+        v1_target, v2_target = self.network.select("value")(
+            batch["high_actor_targets"], batch["high_actor_goals"]
+        )
+        v_target = (v1_target + v2_target) / 2.0
+
+        # 当前状态的价值 V(s, g)
+        v1_curr, v2_curr = self.network.select("value")(
+            batch["observations"], batch["high_actor_goals"]
+        )
+        v_curr = (v1_curr + v2_curr) / 2.0
+
+        # 优势 A = V(next) - V(curr)
+        # 含义：如果这一步转移让价值升高了，说明这是个好动作，应该大力模仿
+        adv = v_target - v_curr
+
+        weight = jnp.exp(adv * self.config["high_awr_temperature"])
+        weight = jnp.minimum(weight, 100.0)
+        weight = jax.lax.stop_gradient(weight)
+
+        log_prob = dist.log_prob(batch["high_actor_targets"])
+
+        # 加权 BC
+        bc_loss = -(weight * log_prob).mean()
+
+        actor_loss = v_loss + self.config["high_bc_alpha"] * bc_loss
         return actor_loss, {
             "loss": actor_loss,
             "v_loss": v_loss,
             "bc_loss": bc_loss,
-            "v_mean": v.mean(),
+            "v_mean": v_pred.mean(),
+            "adv_mean": adv.mean(),
+            "weight_mean": weight.mean(),
         }
 
     # --- 3. Training and Inference ---
@@ -171,13 +214,11 @@ class HIQL2Agent(flax.struct.PyTreeNode):
     # The total_loss, target_update, and update functions remain largely the same,
     # just ensuring all four losses are summed. I'm reusing the previous version's structure.
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params):
         """Compute the total loss."""
         # A single grad_params dict is passed, containing keys for all trainable modules:
         # 'modules_state_encoder', 'modules_value', 'modules_critic', 'modules_low_actor', 'modules_high_actor'
         info = {}
-        rng = rng if rng is not None else self.rng
-        rng, low_actor_rng, high_actor_rng = jax.random.split(rng, 3)
 
         value_loss, value_info = self.value_loss(batch, grad_params)
         for k, v in value_info.items():
@@ -187,15 +228,11 @@ class HIQL2Agent(flax.struct.PyTreeNode):
         for k, v in critic_info.items():
             info[f"critic/{k}"] = v
 
-        low_actor_loss, low_actor_info = self.low_actor_loss(
-            batch, grad_params, low_actor_rng
-        )
+        low_actor_loss, low_actor_info = self.low_actor_loss(batch, grad_params)
         for k, v in low_actor_info.items():
             info[f"low_actor/{k}"] = v
 
-        high_actor_loss, high_actor_info = self.high_actor_loss(
-            batch, grad_params, high_actor_rng
-        )
+        high_actor_loss, high_actor_info = self.high_actor_loss(batch, grad_params)
         for k, v in high_actor_info.items():
             info[f"high_actor/{k}"] = v
 
@@ -214,10 +251,10 @@ class HIQL2Agent(flax.struct.PyTreeNode):
     @jax.jit
     def update(self, batch):
         """Update the agent and return a new agent with information dictionary."""
-        new_rng, rng = jax.random.split(self.rng)
+        new_rng, _ = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params)
 
         # apply_loss_fn handles calculating gradients for all parameters in grad_params
         # and applying them.
@@ -232,24 +269,16 @@ class HIQL2Agent(flax.struct.PyTreeNode):
     # w_rep = high_dist.sample(seed=high_seed)
     @jax.jit
     def sample_actions(self, observations, goals=None, seed=None, temperature=1.0):
-        """Sample actions hierarchically in the latent space."""
-        high_seed, low_seed = jax.random.split(seed)
-
-        # 1. Encode states and goals into representations. The encoder now normalizes them.
-        s_rep = self.network.select("state_encoder")(observations)
-        g_rep = self.network.select("state_encoder")(goals)
-
-        # 2. High-level policy proposes a subgoal representation
+        """Sample actions hierarchically in the original state space."""
         high_dist = self.network.select("high_actor")(
-            s_rep, g_rep, temperature=temperature
+            observations, goals, temperature=temperature
         )
-        w_rep = high_dist.sample(seed=high_seed)
+        subgoals = high_dist.mode()
 
-        # 3. Low-level policy proposes an action to reach that subgoal representation
         low_dist = self.network.select("low_actor")(
-            s_rep, w_rep, temperature=temperature
+            observations, subgoals, temperature=temperature
         )
-        actions = low_dist.sample(seed=low_seed)
+        actions = low_dist.mode()
 
         actions = jnp.clip(actions, -1, 1)
         return actions
@@ -258,99 +287,63 @@ class HIQL2Agent(flax.struct.PyTreeNode):
     def create(cls, seed, ex_observations, ex_actions, config):
         """Create a new agent with the unified and NORMALIZED encoder architecture."""
         rng = jax.random.PRNGKey(seed)
-        rng, init_rng = jax.random.split(rng, 2)
+        rng, init_rng = jax.random.split(rng)
 
         action_dim = ex_actions.shape[-1]
-        rep_dim = config["rep_dim"]
+        obs_dim = ex_observations.shape[-1]
+        ex_goals = ex_observations
 
-        # --- 1. Define the Unified State Encoder with Normalization ---
+        # --- Define Encoders based on environment type ---
+        gc_encoder = None
         if config["encoder"] is not None:
-            # For image-based envs, we construct an encoder that first uses an
-            # IMPALA-style CNN and then normalizes the output.
+            # TODO: This setup is currently NOT compatible with image-based envs
+            # because the high-level actor predicts a high-dimensional state, which
+            # is infeasible. This code is tailored for state-based envs like Pointmaze.
+            # For image envs, one would need to revert to a representation-based approach.
+            encoder_module = encoder_modules[config["encoder"]]()
+            gc_encoder = GCEncoder(concat_encoder=encoder_module)
 
-            # We need to ensure the final output dimension of the base encoder is rep_dim.
-            # We can do this by creating a partial with the correct mlp_hidden_dims.
-            base_encoder_cls = encoder_modules[config["encoder"]]
-
-            # Get the original mlp_hidden_dims, but replace the last element with rep_dim
-            original_mlp_dims = list(
-                base_encoder_cls.kwargs.get("mlp_hidden_dims", (512,))
-            )
-            original_mlp_dims[-1] = rep_dim
-
-            encoder_module_base = functools.partial(
-                base_encoder_cls, mlp_hidden_dims=tuple(original_mlp_dims)
-            )
-
-            state_encoder_def = nn.Sequential([encoder_module_base(), nn.tanh])
-
-        else:  # For state-based envs, use a simple MLP encoder followed by normalization.
-
-            class StateEncoder(nn.Module):
-                @nn.compact
-                def __call__(self, x):
-                    net = nn.Sequential(
-                        [
-                            MLP(
-                                hidden_dims=(*config["value_hidden_dims"], rep_dim),
-                                activate_final=False,
-                                name="EncoderMLP",
-                            ),
-                            nn.tanh,  # CRITICAL: Add normalization layer at the end
-                        ]
-                    )
-                    return net(x)
-
-            state_encoder_def = StateEncoder()
-
-        # --- 2. Define Core Modules with Identity Encoders ---
-        # All modules below will operate on representations of size `rep_dim`
-
-        # Value Function: V(s_rep, g_rep)
+        # --- Define Core Modules ---
         value_def = GCValue(
             hidden_dims=config["value_hidden_dims"],
             layer_norm=config["layer_norm"],
-            ensemble=True,  # Twin V
-            gc_encoder=GCEncoder(state_encoder=Identity(), goal_encoder=Identity()),
+            ensemble=True,  # Using Twin V-functions for stability
+            gc_encoder=copy.deepcopy(gc_encoder),
         )
 
-        # Critic (Q-function): Q(s_rep, a, g_rep)
         critic_def = GCValue(
             hidden_dims=config["value_hidden_dims"],
             layer_norm=config["layer_norm"],
-            ensemble=True,  # Twin Q
-            gc_encoder=GCEncoder(state_encoder=Identity(), goal_encoder=Identity()),
+            ensemble=True,
+            gc_encoder=copy.deepcopy(gc_encoder),
         )
 
-        # Low-level Actor: pi^l(a | s_rep, w_rep)
         low_actor_def = GCActor(
             hidden_dims=config["actor_hidden_dims"],
             action_dim=action_dim,
             const_std=config["const_std"],
-            gc_encoder=GCEncoder(state_encoder=Identity(), goal_encoder=Identity()),
+            gc_encoder=copy.deepcopy(gc_encoder),
         )
 
-        # High-level Actor: pi^h(w_rep | s_rep, g_rep)
         high_actor_def = GCActor(
             hidden_dims=config["actor_hidden_dims"],
-            action_dim=rep_dim,  # Predicts a representation
-            tanh_squash=True,
+            action_dim=obs_dim,  # Predicts a coordinate
             const_std=config["const_std"],
-            gc_encoder=GCEncoder(state_encoder=Identity(), goal_encoder=Identity()),
+            gc_encoder=copy.deepcopy(gc_encoder),
         )
 
-        # --- 3. Initialize Networks ---
-        # Example inputs are now representations
-        ex_rep = jnp.zeros((ex_observations.shape[0], rep_dim))
-
+        # --- Initialize Networks ---
         network_info = dict(
-            state_encoder=(state_encoder_def, ex_observations),
-            value=(value_def, (ex_rep, ex_rep)),
-            critic=(critic_def, (ex_rep, ex_rep, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_rep, ex_rep, ex_actions)),
-            low_actor=(low_actor_def, (ex_rep, ex_rep)),
-            high_actor=(high_actor_def, (ex_rep, ex_rep)),
+            value=(value_def, (ex_observations, ex_goals)),
+            critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
+            target_critic=(
+                copy.deepcopy(critic_def),
+                (ex_observations, ex_goals, ex_actions),
+            ),
+            low_actor=(low_actor_def, (ex_observations, ex_goals)),
+            high_actor=(high_actor_def, (ex_observations, ex_goals)),
         )
+
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -382,10 +375,11 @@ def get_config():
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
             expectile=0.9,  # IQL expectile.
+            low_awr_temperature=3.0,  # 低层 AWR 温度
+            high_awr_temperature=3.0,  # 高层 AWR 温度 (越大区分度越高，但也越不稳定)
             low_bc_alpha=0.1,  # Low-level BC coefficient in DDPG+BC.
-            high_bc_alpha=0.01,  # High-level BC coefficient in DDPG+BC.
+            high_bc_alpha=1.0,  # High-level BC coefficient in DDPG+BC.
             subgoal_steps=25,  # Subgoal steps.
-            rep_dim=10,  # Goal representation dimension.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(
