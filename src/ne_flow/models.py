@@ -204,6 +204,29 @@ def ensemblize(cls, num_qs, out_axes=0, **kwargs):
     )
 
 
+class FourierFeatures(nn.Module):
+    # used for timestep embedding
+    output_size: int = 64
+    learnable: bool = False
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        if self.learnable:
+            w = self.param(
+                "kernel",
+                nn.initializers.normal(0.2),
+                (self.output_size // 2, x.shape[-1]),
+                jnp.float32,
+            )
+            f = 2 * jnp.pi * x @ w.T
+        else:
+            half_dim = self.output_size // 2
+            f = jnp.log(10000) / (half_dim - 1)
+            f = jnp.exp(jnp.arange(half_dim) * -f)
+            f = x * f
+        return jnp.concatenate([jnp.cos(f), jnp.sin(f)], axis=-1)
+
+
 class Identity(nn.Module):
     """Identity layer."""
 
@@ -702,3 +725,59 @@ class GCIQEValue(nn.Module):
             return v, phi_s, phi_g
         else:
             return v
+
+
+class GCFlowActor(nn.Module):
+    """Actor vector field network for flow matching.
+
+    Attributes:
+        hidden_dims: Hidden layer dimensions.
+        action_dim: Action dimension.
+        layer_norm: Whether to apply layer normalization.
+        gc_encoder: Optional encoder module to encode the inputs.
+    """
+
+    hidden_dims: Sequence[int]
+    action_dim: int
+    layer_norm: bool = False
+    gc_encoder: nn.Module = None
+    use_fourier_features: bool = False
+    fourier_feature_dim: int = 64
+
+    def setup(self) -> None:
+        self.mlp = MLP(
+            (*self.hidden_dims, self.action_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm,
+        )
+        if self.use_fourier_features:
+            self.ff = FourierFeatures(self.fourier_feature_dim)
+
+    @nn.compact
+    def __call__(self, observations, goals, actions, times, is_encoded=False):
+        """Return the vectors at the given states, goals, actions, and times (optional).
+
+        Args:
+            observations: Observations.
+            goals: Goals.
+            actions: Actions.
+            times: Times (optional).
+            is_encoded: Whether the goal are already encoded.
+        """
+        if self.gc_encoder is not None:
+            inputs = self.gc_encoder(observations, goals, goal_encoded=is_encoded)
+        else:
+            inputs = [observations, goals]
+        inputs.append(actions)
+
+        if times is None:
+            inputs = jnp.concatenate(inputs, axis=-1)
+        else:
+            if self.use_fourier_features:
+                times = self.ff(times)
+            inputs.append(times)
+            inputs = jnp.concatenate(inputs, axis=-1)
+
+        v = self.mlp(inputs)
+
+        return v
