@@ -519,7 +519,7 @@ class HGCChunkDataset(HGCDataset):
         assert "horizon_length" in self.config, "horizon_length未在配置中指定"
         self.horizon_length = self.config["horizon_length"]
 
-    def sample_chunk(
+    def sample(
         self,
         batch_size: int,
         idxs: Optional[np.ndarray] = None,

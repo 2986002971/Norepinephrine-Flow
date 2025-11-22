@@ -307,7 +307,7 @@ class NENoHighAgent(flax.struct.PyTreeNode):
         q1, q2 = self.network.select("critic")(
             flat_obs_low, flat_subgoals, flat_actions
         )
-        flat_q = jnp.minimum(q1, q2)
+        flat_q = (q1 + q2) / 2  # [B*N]
         q_scores = flat_q.reshape(observations.shape[0], N)  # reshape to [B, N]
 
         # Select Best Action Chunk
@@ -402,6 +402,7 @@ def get_config():
             expectile=0.9,  # IQL Expectile (0.7-0.9 is standard)
             subgoal_steps=20,  # unused
             # Dataset Params
+            dataset_class="HGCChunkDataset",
             value_p_curgoal=0.2,  # Probability of using the current state as the value goal.
             value_p_trajgoal=0.5,  # Probability of using a future state in the same trajectory as the value goal.
             value_p_randomgoal=0.3,  # Probability of using a random state as the value goal.
