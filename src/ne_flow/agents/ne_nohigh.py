@@ -15,7 +15,7 @@ from ne_flow.models import (
 )
 
 
-class FlowHIQLAgent(flax.struct.PyTreeNode):
+class NENoHighAgent(flax.struct.PyTreeNode):
     """
     Flow-HIQL: Hierarchical Implicit Q-Learning with Flow Matching & Action Chunking.
 
@@ -143,50 +143,7 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
             "q_mean": 0.5 * (q1 + q2).mean(),
         }
 
-    # --- 2. Hierarchical Policy Learning (Weighted Flow Matching) ---
-    def high_actor_loss(self, batch, grad_params, rng):
-        """
-        High-Level Policy: Predicts Subgoal w.
-        Advantage: A = V(w_data, g) - V(s, g)
-        """
-        # 1. Calculate Advantage
-        # V(s, g) - Baseline
-        v_curr = self.network.select("value")(
-            batch["observations"], batch["high_actor_goals"]
-        )
-        # V(w_data, g) - Quality of the data sample
-        # batch['high_actor_targets'] contains the actual subgoals from dataset
-        v_next = self.network.select("value")(
-            batch["high_actor_targets"], batch["high_actor_goals"]
-        )
-
-        adv = v_next - v_curr
-
-        # 2. Calculate AWR Weights
-        weights = jnp.exp(adv * self.config["high_awr_temp"])
-        weights = jnp.clip(weights, max=100.0)
-        weights = jax.lax.stop_gradient(weights)
-
-        # Get Squared Diff [B, Obs_Dim]
-        sq_diff = self.compute_flow_matching_sq_diff(
-            self.network,
-            "high_actor",
-            batch["observations"],
-            batch["high_actor_goals"],
-            batch["high_actor_targets"],
-            rng,
-            grad_params,
-        )
-
-        loss_per_sample = jnp.mean(sq_diff, axis=-1)  # Reduce -> [B]
-        loss = jnp.mean(weights * loss_per_sample)
-
-        return loss, {
-            "high_actor_loss": loss,
-            "high_adv_mean": adv.mean(),
-            "high_weights": weights.mean(),
-        }
-
+    # --- 2. Weighted Flow Matching ---
     def low_actor_loss(self, batch, grad_params, rng):
         """
         Low-Level Policy: Predicts Action Chunk a_t:t+h.
@@ -220,7 +177,7 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
             self.network,
             "low_actor",
             batch["observations"],
-            batch["low_actor_goals"],
+            batch["high_actor_goals"],
             actions,
             rng,
             grad_params,
@@ -265,17 +222,12 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         for k, v in c_info.items():
             info[f"critic/{k}"] = v
 
-        # High Actor Update
-        h_loss, h_info = self.high_actor_loss(batch, grad_params, high_rng)
-        for k, v in h_info.items():
-            info[f"high_actor/{k}"] = v
-
         # Low Actor Update
         l_loss, l_info = self.low_actor_loss(batch, grad_params, low_rng)
         for k, v in l_info.items():
             info[f"low_actor/{k}"] = v
 
-        total = v_loss + c_loss + h_loss + l_loss
+        total = v_loss + c_loss + l_loss
         return total, info
 
     def target_update(self, network, module_name):
@@ -325,45 +277,7 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         return x
 
     @jax.jit
-    def sample_high_actions(self, observations, goals, rng=None):
-        """
-        Cascaded Best-of-N Inference.
-        1. Sample N subgoals -> Rank with V -> Pick Best w*
-        2. Sample M action chunks -> Rank with Q -> Pick Best a*
-        """
-        rng = rng if rng is not None else self.rng
-        rng, high_rng = jax.random.split(rng)
-
-        N = self.config["high_num_samples"]
-        subgoal_dim = observations.shape[-1]  # Assuming subgoal is state
-
-        # [B, N, goal_dim]
-        candidate_subgoals = self.sample_flow_actions(
-            "high_actor", observations, goals, subgoal_dim, N, high_rng
-        )
-
-        # Evaluate with V(w, g)
-        # Reshape for network: [B*N, ...]
-        flat_obs = candidate_subgoals.reshape(-1, subgoal_dim)
-        flat_goals = jnp.repeat(goals[:, None, :], N, axis=1).reshape(
-            -1, goals.shape[-1]
-        )
-
-        # V(w, g)
-        flat_scores = self.network.select("value")(flat_obs, flat_goals)
-        scores = flat_scores.reshape(observations.shape[0], N)  # [B, N]
-
-        # Select Best Subgoal
-        best_idx = jnp.argmax(scores, axis=1)  # [B,]
-        # Gather best subgoals
-        best_subgoals = candidate_subgoals[
-            jnp.arange(len(best_idx)), best_idx
-        ]  # [B, goal_dim]
-
-        return best_subgoals
-
-    @jax.jit
-    def sample_low_actions(self, observations, subgoals, rng=None):
+    def sample_low_actions(self, observations, goals, rng=None):
         """
         Low-Level Action Chunk Sampling given Subgoals.
         """
@@ -376,7 +290,7 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
 
         # [B, N, A*H]
         candidate_actions = self.sample_flow_actions(
-            "low_actor", observations, subgoals, action_dim, N, low_rng
+            "low_actor", observations, goals, action_dim, N, low_rng
         )
         candidate_actions = jnp.clip(candidate_actions, -1.0, 1.0)  # clip to avoid OOD
 
@@ -384,7 +298,7 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         flat_obs_low = jnp.repeat(observations[:, None, :], N, axis=1).reshape(
             -1, observations.shape[-1]
         )
-        flat_subgoals = jnp.repeat(subgoals[:, None, :], N, axis=1).reshape(
+        flat_subgoals = jnp.repeat(goals[:, None, :], N, axis=1).reshape(
             -1, subgoal_dim
         )
         flat_actions = candidate_actions.reshape(-1, action_dim)
@@ -409,7 +323,6 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng)
 
-        obs_dim = ex_observations.shape[-1]
         action_dim = ex_actions.shape[-1]
         # Action Chunk dim
         full_action_dim = action_dim * (
@@ -437,13 +350,6 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
             ensemble=True,  # Dual Q
             gc_encoder=None,
         )
-        # 3. High Flow (Subgoals)
-        high_actor_def = GCFlowActor(
-            hidden_dims=config["actor_hidden_dims"],
-            action_dim=obs_dim,
-            layer_norm=config["layer_norm"],
-            gc_encoder=None,
-        )
         # 4. Low Flow (Action Chunks)
         low_actor_def = GCFlowActor(
             hidden_dims=config["actor_hidden_dims"],
@@ -458,10 +364,6 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
             target_critic=(
                 copy.deepcopy(critic_def),
                 (ex_observations, ex_goals, ex_full_actions),
-            ),
-            high_actor=(
-                high_actor_def,
-                (ex_observations, ex_goals, ex_subgoals, ex_time),
             ),
             low_actor=(
                 low_actor_def,
@@ -488,7 +390,7 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name="neflow",
+            agent_name="nohigh",
             lr=3e-4,
             batch_size=1024,
             actor_hidden_dims=(512, 512, 512, 512),
@@ -498,8 +400,7 @@ def get_config():
             tau=0.005,
             # IQL Params
             expectile=0.9,  # IQL Expectile (0.7-0.9 is standard)
-            # Hierarchical Params
-            subgoal_steps=20,  # Subgoal steps.
+            subgoal_steps=20,  # unused
             # Dataset Params
             value_p_curgoal=0.2,  # Probability of using the current state as the value goal.
             value_p_trajgoal=0.5,  # Probability of using a future state in the same trajectory as the value goal.
@@ -512,13 +413,11 @@ def get_config():
             gc_negative=True,  # Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as reward.
             # Flow / AWR Params
             flow_steps=10,  # ODE Integration steps
-            high_awr_temp=3.0,  # 高层 AWR 温度 (越大区分度越高，但也越不稳定)
             low_awr_temp=3.0,  # 底层 AWR 温度 (越大区分度越高，但也越不稳定)
             # Chunking Params
             action_chunking=True,
             horizon_length=8,  # Chunk size
             # Inference Params (Best-of-N)
-            high_num_samples=32,  # Samples for subgoal
             low_num_samples=32,  # Samples for action chunk
             # Misc
             encoder=None,

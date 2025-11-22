@@ -93,14 +93,10 @@ def evaluate_chunked_agent(
             rng, high_key, low_key = jax.random.split(rng, 3)
             obs = obs[None, :]  # 添加batch维度
             # =================== 核心评估逻辑 ===================
-            # 采样高层子目标
-            subgoal = agent.sample_high_actions(
-                observations=obs, goals=goal, rng=high_key
-            )
 
             # 采样底层动作块 [1, action_dim*horizon_length]
             action_chunk = agent.sample_low_actions(
-                observations=obs, subgoals=subgoal, rng=low_key
+                observations=obs, goals=goal, rng=low_key
             )
             action_chunk = np.array(action_chunk).reshape(-1, action_dim)
 
