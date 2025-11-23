@@ -1,5 +1,5 @@
 import functools
-from typing import Any, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 import distrax
 import flax
@@ -781,3 +781,239 @@ class GCFlowActor(nn.Module):
         v = self.mlp(inputs)
 
         return v
+
+
+class ContinuousPositionEmbedding(nn.Module):
+    """Sinus positional embedding adapted for continuous signal with given range"""
+
+    size_emb: int
+    period_min: float
+    period_max: float
+
+    def setup(self):
+        size_half = self.size_emb // 2
+        tensor_period_ratio = jnp.linspace(0.0, 1.0, size_half)
+        self.periods = self.period_min * jnp.power(
+            self.period_max / self.period_min, tensor_period_ratio
+        )
+
+    def __call__(self, tensor_time: jnp.ndarray) -> jnp.ndarray:
+        """Forward.
+        Args:
+            tensor_time: Input time (size_batch, 1).
+        Returns:
+            Generated embedding (size_batch, size_emb).
+        """
+        size_batch = tensor_time.shape[0]
+        tensor_phase = tensor_time / self.periods
+
+        tensor_value = jnp.stack(
+            [
+                jnp.sin(2.0 * jnp.pi * tensor_phase),
+                jnp.cos(2.0 * jnp.pi * tensor_phase),
+            ],
+            axis=-1,
+        )
+
+        tensor_value = tensor_value.reshape(size_batch, self.size_emb)
+        return tensor_value
+
+
+class BlockConv1d(nn.Module):
+    """1d convolution keeping same temporal length with non-linearity and normalization"""
+
+    size_channel_in: int
+    size_channel_out: int
+    size_kernel: int
+    size_group_norm: int
+
+    @nn.compact
+    def __call__(self, tensor_in: jnp.ndarray) -> jnp.ndarray:
+        x = nn.Conv(
+            features=self.size_channel_out,
+            kernel_size=(self.size_kernel,),
+            strides=(1,),
+            padding="SAME",
+        )(tensor_in)
+        x = nn.GroupNorm(num_groups=self.size_group_norm)(x)
+        x = nn.silu(x)
+        return x
+
+
+class BlockDownsample(nn.Module):
+    """Downscale the sequence by 2"""
+
+    size_channel: int
+
+    @nn.compact
+    def __call__(self, tensor_in: jnp.ndarray) -> jnp.ndarray:
+        return nn.Conv(
+            features=self.size_channel,
+            kernel_size=(2,),
+            strides=(2,),
+            padding="VALID",
+        )(tensor_in)
+
+
+class BlockUpsample(nn.Module):
+    """Upscale the sequence by 2"""
+
+    size_channel: int
+
+    @nn.compact
+    def __call__(self, tensor_in: jnp.ndarray) -> jnp.ndarray:
+        return nn.ConvTranspose(
+            features=self.size_channel,
+            kernel_size=(2,),
+            strides=(2,),
+            padding="VALID",
+        )(tensor_in)
+
+
+class BlockConv1dResidualConditional(nn.Module):
+    """Convolutional block with residual connection and conditioning using FiLM"""
+
+    size_channel_in: int
+    size_channel_out: int
+    size_cond: int
+    size_kernel: int
+    size_group_norm: int
+
+    @nn.compact
+    def __call__(self, tensor_in: jnp.ndarray, tensor_cond: jnp.ndarray) -> jnp.ndarray:
+        cond_film = nn.Dense(features=2 * self.size_channel_out)(tensor_cond)
+        cond_scale = cond_film[..., : self.size_channel_out]
+        cond_bias = cond_film[..., self.size_channel_out :]
+
+        # Expend dim for broadcasting
+        cond_scale = jnp.expand_dims(cond_scale, axis=-2)
+        cond_bias = jnp.expand_dims(cond_bias, axis=-2)
+
+        x = BlockConv1d(
+            size_channel_in=self.size_channel_in,
+            size_channel_out=self.size_channel_out,
+            size_kernel=self.size_kernel,
+            size_group_norm=self.size_group_norm,
+        )(tensor_in)
+
+        x = cond_scale * x + cond_bias
+
+        x = BlockConv1d(
+            size_channel_in=self.size_channel_out,
+            size_channel_out=self.size_channel_out,
+            size_kernel=self.size_kernel,
+            size_group_norm=self.size_group_norm,
+        )(x)
+
+        residual = nn.Conv(features=self.size_channel_out, kernel_size=(1,))(tensor_in)
+        return x + residual
+
+
+class GCUnet(nn.Module):
+    """Implement a 1d convolutional Unet architecture with
+    residual block, group normalization and conditional vector.
+    Uses position sinusoidal embedding.
+    """
+
+    size_channel: int
+    size_emb_transport: int
+    size_channel_hidden: List[int]
+    period_min: float
+    period_max: float
+    size_kernel: int
+    size_group_norm: int
+
+    @nn.compact
+    def __call__(
+        self,
+        observations: jnp.ndarray,  # shape: (batch_size, obs_dim)
+        goals: jnp.ndarray,  # shape: (batch_size, goal_dim)
+        actions: jnp.ndarray,  # shape: (batch_size, seq_len, action_dim)
+        times: jnp.ndarray,  # shape: (batch_size, 1)
+    ) -> jnp.ndarray:
+        """Forward pass of GCUnet.
+
+        Args:
+            observations: 当前观测，形状 (batch_size, obs_dim)
+            goals: 目标状态，形状 (batch_size, goal_dim)
+            actions: 动作序列/轨迹，形状 (batch_size, seq_len, action_dim)
+            times: 时间步，形状 (batch_size, 1)，用于扩散/流模型
+
+        Returns:
+            输出张量，形状 (batch_size, seq_len, size_channel)
+        """
+        # 将 observations 和 goals 拼接成条件向量
+        tensor_cond = jnp.concatenate([observations, goals], axis=-1)
+
+        # 时间嵌入
+        transport_embedded = ContinuousPositionEmbedding(
+            size_emb=self.size_emb_transport,
+            period_min=self.period_min,
+            period_max=self.period_max,
+        )(times)
+
+        transport_embedded = nn.Dense(features=self.size_emb_transport * 4)(
+            transport_embedded
+        )
+        transport_embedded = nn.silu(transport_embedded)
+        transport_embedded = nn.Dense(features=self.size_emb_transport)(
+            transport_embedded
+        )
+        transport_embedded = nn.silu(transport_embedded)
+
+        # 合并条件
+        cond_all = jnp.concatenate([transport_embedded, tensor_cond], axis=-1)
+
+        # 初始输入是 actions
+        x = actions
+
+        list_residuals = []
+
+        # Downsample path
+        list_size_channel = [self.size_channel] + list(self.size_channel_hidden)
+        for i in range(len(list_size_channel) - 1):
+            size_in = list_size_channel[i]
+            size_out = list_size_channel[i + 1]
+
+            x = BlockConv1dResidualConditional(
+                size_channel_in=size_in,
+                size_channel_out=size_out,
+                size_cond=cond_all.shape[-1],
+                size_kernel=self.size_kernel,
+                size_group_norm=self.size_group_norm,
+            )(x, cond_all)
+
+            list_residuals.append(x)
+            x = BlockDownsample(size_channel=size_out)(x)
+
+        # Middle path
+        size_last = list_size_channel[-1]
+        x = BlockConv1dResidualConditional(
+            size_channel_in=size_last,
+            size_channel_out=size_last,
+            size_cond=cond_all.shape[-1],
+            size_kernel=self.size_kernel,
+            size_group_norm=self.size_group_norm,
+        )(x, cond_all)
+
+        # Upsample path
+        for i in range(len(list_size_channel) - 1, 0, -1):
+            size_in = list_size_channel[i]
+            if i == 1:
+                size_out = list(self.size_channel_hidden)[0]
+            else:
+                size_out = list_size_channel[i - 1]
+
+            x = BlockUpsample(size_channel=size_in)(x)
+            x = jnp.concatenate([x, list_residuals.pop()], axis=-1)
+
+            x = BlockConv1dResidualConditional(
+                size_channel_in=x.shape[-1],  # Adjusted for concatenation
+                size_channel_out=size_out,
+                size_cond=cond_all.shape[-1],
+                size_kernel=self.size_kernel,
+                size_group_norm=self.size_group_norm,
+            )(x, cond_all)
+
+        # Final convolution
+        return nn.Conv(features=self.size_channel, kernel_size=(1,))(x)

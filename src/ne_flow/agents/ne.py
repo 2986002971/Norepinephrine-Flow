@@ -1,5 +1,4 @@
 import copy
-from functools import partial
 from typing import Any
 
 import flax
@@ -10,15 +9,13 @@ import optax
 
 from ne_flow.flax_utils import ModuleDict, TrainState, nonpytree_field
 from ne_flow.models import (
-    GCFlowActor,
+    GCUnet,
     GCValue,
 )
 
 
 class NE_Agent(flax.struct.PyTreeNode):
     """
-    Flow-HIQL: Hierarchical Implicit Q-Learning with Flow Matching & Action Chunking.
-
     Features:
     - No DDPG: Purely offline RL via Advantage-Weighted Flow Matching.
     - IQL Value Engine: Single V, Dual Q, Goal-Conditioned.
@@ -46,29 +43,43 @@ class NE_Agent(flax.struct.PyTreeNode):
         network, module_name, obs, goal, target_x, rng, params
     ):
         """
-        Core Flow Matching Logic: Samples noise, interpolates, and computes squared error.
-        Returns element-wise squared difference without reduction.
-        Output shape: [Batch, Dim] (Dim can be flat action chunk size)
+        Core Flow Matching Logic for GCUnet (动作序列版).
+
+        Args:
+            target_x: [Batch, Horizon, Action_dim]
+
+        Returns:
+            [Batch, Horizon, Action_dim] (element-wise squared diff)
         """
         batch_size = obs.shape[0]
-        x_dim = target_x.shape[-1]
+        horizon = target_x.shape[1]
+        action_dim = target_x.shape[2]
 
         rng, x_rng, t_rng = jax.random.split(rng, 3)
 
-        # 1. Sample Noise x0 and Time t
-        x_0 = jax.random.normal(x_rng, (batch_size, x_dim))
+        # 1. Sample noise and time
+        x_0 = jax.random.normal(x_rng, (batch_size, horizon, action_dim))
         x_1 = target_x
-        t = jax.random.uniform(t_rng, (batch_size, 1))
+        t = jax.random.uniform(t_rng, (batch_size, 1))  # [B, 1]
 
-        # 2. Linear Interpolation (Optimal Transport Path)
-        x_t = (1 - t) * x_0 + t * x_1
-        target_velocity = x_1 - x_0
+        # 2. Linear Interpolation
+        # 广播: [B, 1] -> [B, 1, 1] 可以与 [B, H, A] 广播
+        t_broadcast = t[:, :, None]  # [B, 1, 1]
+        x_t = (1 - t_broadcast) * x_0 + t_broadcast * x_1
+        target_velocity = x_1 - x_0  # [B, H, A]
 
-        # 3. Predict Velocity
-        pred_velocity = network.select(module_name)(obs, goal, x_t, t, params=params)
+        # 3. Predict velocity using GCUnet
+        # GCUnet: (observations[B, obs_dim], goals[B, goal_dim], actions[B, H, A], times[B, 1])
+        pred_velocity = network.select(module_name)(
+            obs,
+            goal,
+            x_t,  # [B, H, A]
+            t,  # [B, 1]
+            params=params,
+        )  # [B, H, A]
 
-        # 4. Return Squared Difference (No Mean, No Weighting)
-        return jnp.square(pred_velocity - target_velocity)
+        # 4. Return element-wise squared diff
+        return jnp.square(pred_velocity - target_velocity)  # [B, H, A]
 
     # --- 1. IQL Value Engine (Single V, Dual Q) ---
     def value_loss(self, batch, grad_params):
@@ -152,59 +163,60 @@ class NE_Agent(flax.struct.PyTreeNode):
     def actor_loss(self, batch, grad_params, rng):
         """
         Low-Level Policy: Predicts Action Chunk a_t:t+h.
-        Advantage: A = Q(s, a_chunk, w) - V(s, w)
+        Advantage: A = Q(s, a_chunk, g) - V(s, g)
         """
-        if self.config["action_chunking"]:
-            actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
-        else:
-            actions = batch["actions"]
+        # 直接使用序列结构 [B, H, A]
+        actions = batch["actions"]
 
-        # 1. Calculate Advantage
-        # V(s, w) - Baseline
-        v = self.network.select("value")(batch["observations"], batch["actor_goals"])
-        # Q(s, a, w) - Quality of the action chunk
+        # 1. Calculate Advantage (Critic needs flat actions)
+        # V(s, g)
+        v = self.network.select("value")(
+            batch["observations"], batch["actor_goals"]
+        )  # [B]
+
+        # 为 Critic 展平动作: [B, H, A] -> [B, H*A]
+        actions_flat = jnp.reshape(actions, (actions.shape[0], -1))
+
+        # Q(s, a, g)
         q1, q2 = self.network.select("critic")(
-            batch["observations"], batch["actor_goals"], actions
-        )
+            batch["observations"], batch["actor_goals"], actions_flat
+        )  # [B]
         q = jnp.minimum(q1, q2)
 
-        adv = q - v
+        adv = q - v  # [B]
 
-        # 2. Calculate AWR Weights [B]
+        # 2. AWR weights [B]
         weights = jnp.exp(adv * self.config["awr_temp"])
         weights = jnp.clip(weights, max=100.0)
-        weights = jax.lax.stop_gradient(weights)
+        weights = jax.lax.stop_gradient(weights)  # [B]
 
-        # 1. Get Squared Diff [B, H*A]
+        # 3. Get Squared Diff [B, H, A] from GCUnet
         sq_diff = self.compute_flow_matching_sq_diff(
             self.network,
             "actor",
             batch["observations"],
             batch["actor_goals"],
-            actions,
+            actions,  # 直接传入 [B, H, A]
             rng,
             grad_params,
-        )
+        )  # [B, H, A]
 
-        # 2. Reshape to recover time horizon: [B, H*A] -> [B, H, A]
-        batch_size = sq_diff.shape[0]
-        horizon = batch["valid"].shape[1]
-        action_dim = sq_diff.shape[-1] // horizon
+        # 4. Apply validity mask per time step
+        # [B, H, A] -> [B, H]
+        loss_per_step = jnp.mean(sq_diff, axis=-1)  # 在动作维度上平均
 
-        sq_diff_reshaped = jnp.reshape(sq_diff, (batch_size, horizon, action_dim))
-
-        # 3. Mean over action dimensions first: [B, H, A] -> [B, H]
-        loss_per_step = jnp.mean(sq_diff_reshaped, axis=-1)
-
-        # 4. Apply Valid Mask and AWR Weights
         # step_weights: [B, H]
         step_weights = batch["valid"] * weights[:, None]
-        loss = jnp.mean(step_weights * loss_per_step)
+
+        # 5. Final loss
+        masked_loss = step_weights * loss_per_step  # [B, H]
+        loss = jnp.mean(masked_loss)  # 全局平均
 
         return loss, {
             "actor_loss": loss,
             "adv_mean": adv.mean(),
             "weights": weights.mean(),
+            "loss_per_step_mean": loss_per_step.mean(),
         }
 
     # --- 3. Training Loop Boilerplate ---
@@ -335,58 +347,81 @@ class NE_Agent(flax.struct.PyTreeNode):
         # Return [A] without batch dimension
         return current_action[0]
 
-    # --- 5. Best-of-N Sampling (JIT-compiled) ---
-    @partial(jax.jit, static_argnames=("module_name", "out_dim", "num_samples"))
-    def sample_flow_actions(self, module_name, obs, goal, out_dim, num_samples, rng):
-        """Helper: Generate N samples from a conditional flow model."""
+    # --- 5. Best-of-N Sampling ---
+    def sample_flow_actions(
+        self, module_name, obs, goal, horizon, action_dim, num_samples, rng
+    ):
+        """Generate N samples from a conditional flow model for action chunks."""
         batch_size = obs.shape[0]
-        obs_rep = jnp.repeat(obs[:, None, :], num_samples, axis=1)
-        goal_rep = jnp.repeat(goal[:, None, :], num_samples, axis=1)
 
-        x = jax.random.normal(rng, (batch_size, num_samples, out_dim))
+        # Repeat for samples: [B, D] -> [B, N, D]
+        obs_rep = jnp.repeat(obs[:, None, :], num_samples, axis=1)  # [B, N, obs_dim]
+        goal_rep = jnp.repeat(goal[:, None, :], num_samples, axis=1)  # [B, N, goal_dim]
+
+        # Initialize action sequence: [B, N, H, A]
+        x = jax.random.normal(rng, (batch_size, num_samples, horizon, action_dim))
 
         steps = self.config["flow_steps"]
         dt = 1.0 / steps
+
         for i in range(steps):
             t_val = i / steps
+            # Create time tensor: [B, N, 1]
             t = jnp.full((batch_size, num_samples, 1), t_val)
 
-            vel = self.network.select(module_name)(obs_rep, goal_rep, x, t)
+            # reshape: [B, N, ...] -> [B*N, ...]
+            obs_flat = obs_rep.reshape(-1, obs_rep.shape[-1])
+            goal_flat = goal_rep.reshape(-1, goal_rep.shape[-1])
+            x_flat = x.reshape(-1, *x.shape[-2:])  # [B*N, H, A]
+            t_flat = t.reshape(-1, 1)  # [B*N, 1]
+
+            vel_flat = self.network.select(module_name)(
+                obs_flat, goal_flat, x_flat, t_flat
+            )
+
+            # Reshape back: [B*N, H, A] -> [B, N, H, A]
+            vel = vel_flat.reshape(batch_size, num_samples, horizon, action_dim)
+
+            # Update: [B, N, H, A]
             x = x + vel * dt
 
-        return x
+        # Reshape to flat for Q evaluation: [B, N, H, A] -> [B, N, H*A]
+        return jnp.reshape(x, (batch_size, num_samples, -1))
 
     @jax.jit
     def sample_low_actions(self, observations, goals, rng):
         """
         Low-Level Action Chunk Sampling given Goals.
-        Returns: [B, H*A]
+        Returns: [B, H*A] (flattened for consistency with critic)
         """
         N = self.config["low_num_samples"]
-        action_dim = self.config["action_dim"] * self.config["horizon_length"]
-        subgoal_dim = observations.shape[-1]
+        horizon = self.config["horizon_length"]
+        action_dim = self.config["action_dim"]
 
-        candidate_actions = self.sample_flow_actions(
-            "actor", observations, goals, action_dim, N, rng
-        )  # [B, N, H*A]
-        candidate_actions = jnp.clip(candidate_actions, -1.0, 1.0)
+        # Get samples: [B, N, H*A]
+        candidate_actions_flat = self.sample_flow_actions(
+            "actor", observations, goals, horizon, action_dim, N, rng
+        )
+        candidate_actions_flat = jnp.clip(candidate_actions_flat, -1.0, 1.0)
 
-        # Evaluate with Q(s, a, w)
-        flat_obs = jnp.repeat(observations[:, None, :], N, axis=1).reshape(
-            -1, observations.shape[-1]
-        )
-        flat_subgoals = jnp.repeat(goals[:, None, :], N, axis=1).reshape(
-            -1, subgoal_dim
-        )
-        flat_actions = candidate_actions.reshape(-1, action_dim)
+        # Q evaluation (needs flattening)
+        batch_size = observations.shape[0]
+        obs_dim = observations.shape[-1]
+        goal_dim = goals.shape[-1]
+
+        flat_obs = jnp.repeat(observations[:, None, :], N, axis=1).reshape(-1, obs_dim)
+        flat_subgoals = jnp.repeat(goals[:, None, :], N, axis=1).reshape(-1, goal_dim)
+        flat_actions = candidate_actions_flat.reshape(-1, horizon * action_dim)
 
         q1, q2 = self.network.select("critic")(flat_obs, flat_subgoals, flat_actions)
         flat_q = (q1 + q2) / 2
-        q_scores = flat_q.reshape(observations.shape[0], N)
+        q_scores = flat_q.reshape(batch_size, N)  # [B, N]
 
         # Select Best Action Chunk
-        best_idx = jnp.argmax(q_scores, axis=1)
-        best_actions = candidate_actions[jnp.arange(len(best_idx)), best_idx]
+        best_idx = jnp.argmax(q_scores, axis=1)  # [B]
+        best_actions = candidate_actions_flat[
+            jnp.arange(len(best_idx)), best_idx
+        ]  # [B, H*A]
 
         return best_actions
 
@@ -396,15 +431,17 @@ class NE_Agent(flax.struct.PyTreeNode):
         rng, init_rng = jax.random.split(rng)
 
         action_dim = ex_actions.shape[-1]
-        # Action Chunk dim
-        full_action_dim = action_dim * (
-            config["horizon_length"] if config["action_chunking"] else 1
-        )
+        obs_dim = ex_observations.shape[-1]
+        horizon = config["horizon_length"] if config["action_chunking"] else 1
 
         # Placeholders for initialization
         ex_goals = ex_observations
-        ex_subgoals = ex_observations
-        ex_full_actions = jnp.zeros((1, full_action_dim))
+        # 1. Critic 需要展平的动作: [1, H*A]
+        full_action_dim_flat = action_dim * horizon
+        ex_actions_flat = jnp.zeros((1, full_action_dim_flat))
+        # 2. Actor 需要序列结构: [1, H, A]
+        ex_actions_seq = jnp.zeros((1, horizon, action_dim))
+        # 3. Time 保持不变: [1, 1]
         ex_time = jnp.zeros((1, 1))
 
         # Networks
@@ -420,23 +457,28 @@ class NE_Agent(flax.struct.PyTreeNode):
             ensemble=True,
             gc_encoder=None,
         )
-        actor_def = GCFlowActor(
-            hidden_dims=config["actor_hidden_dims"],
-            action_dim=full_action_dim,
-            layer_norm=config["layer_norm"],
-            gc_encoder=None,
+        actor_def = GCUnet(
+            size_channel=action_dim,  # 输入通道数 = 动作维度
+            size_emb_transport=32,  # TODO: 配置化
+            size_channel_hidden=[64, 128, 256],
+            period_min=0.002,
+            period_max=10.0,
+            size_kernel=3,
+            size_group_norm=8,
         )
 
         network_info = dict(
             value=(value_def, (ex_observations, ex_goals)),
-            critic=(critic_def, (ex_observations, ex_goals, ex_full_actions)),
+            # Critic 使用展平动作
+            critic=(critic_def, (ex_observations, ex_goals, ex_actions_flat)),
             target_critic=(
                 copy.deepcopy(critic_def),
-                (ex_observations, ex_goals, ex_full_actions),
+                (ex_observations, ex_goals, ex_actions_flat),
             ),
+            # Actor 使用序列动作
             actor=(
                 actor_def,
-                (ex_observations, ex_subgoals, ex_full_actions, ex_time),
+                (ex_observations, ex_goals, ex_actions_seq, ex_time),
             ),
         )
 
@@ -452,13 +494,13 @@ class NE_Agent(flax.struct.PyTreeNode):
         params["modules_target_critic"] = params["modules_critic"]
 
         # Store dimensions for inference buffer initialization
-        config["obs_dim"] = ex_observations.shape[-1]
+        config["obs_dim"] = obs_dim
+        config["goal_dim"] = obs_dim  # Assuming goal dim = obs dim
         config["action_dim"] = action_dim  # Raw action dim
+        config["horizon"] = horizon
 
         # Initialize stateful inference buffers in a mutable dict
-        horizon = config["horizon_length"]
         batch_size = 1  # Single environment assumption
-
         inference_state = {
             "action_chunk_buffer": jnp.zeros((batch_size, horizon, action_dim)),
             "chunk_step_idx": 0,
