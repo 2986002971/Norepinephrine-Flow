@@ -4,8 +4,8 @@ from ne_flow.agents.gciql import GCIQLAgent
 from ne_flow.agents.gcivl import GCIVLAgent
 from ne_flow.agents.hiql import HIQLAgent
 from ne_flow.agents.hiql2 import HIQL2Agent
-from ne_flow.agents.ne import FlowHIQLAgent
-from ne_flow.agents.ne_nohigh import NENoHighAgent
+from ne_flow.agents.ne import NE_Agent
+from ne_flow.agents.ne_with_high import FlowHIQLAgent
 from ne_flow.agents.qrl import QRLAgent
 from ne_flow.agents.sac import SACAgent
 
@@ -18,6 +18,6 @@ agents = dict(
     sac=SACAgent,
     hiql=HIQLAgent,
     hiql2=HIQL2Agent,
-    neflow=FlowHIQLAgent,
-    nohigh=NENoHighAgent,
+    ne_with_high=FlowHIQLAgent,
+    neflow=NE_Agent,
 )

@@ -12,7 +12,13 @@ from absl import app, flags
 from ml_collections import config_flags
 
 from ne_flow.agents import agents
-from ne_flow.datasets import Dataset, GCDataset, HGCChunkDataset, HGCDataset
+from ne_flow.datasets import (
+    Dataset,
+    GCChunkDataset,
+    GCDataset,
+    HGCChunkDataset,
+    HGCDataset,
+)
 from ne_flow.env_utils import make_env_and_datasets
 from ne_flow.evaluation import evaluate
 from ne_flow.flax_utils import restore_agent, save_agent
@@ -79,6 +85,7 @@ def main(_):
 
     dataset_class = {
         "GCDataset": GCDataset,
+        "GCChunkDataset": GCChunkDataset,
         "HGCDataset": HGCDataset,
         "HGCChunkDataset": HGCChunkDataset,
     }[config["dataset_class"]]

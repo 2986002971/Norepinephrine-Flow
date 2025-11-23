@@ -459,12 +459,169 @@ class HGCDataset(GCDataset):
 
 
 @dataclasses.dataclass
+class GCChunkDataset(GCDataset):
+    """目标条件动作块数据集
+
+    批次数据结构（sample返回）:
+    --------------------------------
+    observations: np.ndarray
+        起始观测状态，形状 [batch_size, obs_dim]
+        对应时间步 s_t
+
+    actions: np.ndarray
+        动作序列，形状 [batch_size, horizon_length, action_dim]
+        对应时间步 [a_t, a_{t+1}, ..., a_{t+H-1}]
+
+    next_observations: np.ndarray
+        H步后的观测状态，形状 [batch_size, obs_dim]
+        对应时间步 s_{t+H}（钳位到轨迹边界）
+
+    value_goals: np.ndarray
+        价值目标状态，形状 [batch_size, goal_dim]
+        用于价值函数训练的最终目标
+
+    actor_goals: np.ndarray
+        高层演员目标状态，形状 [batch_size, goal_dim]
+        用于策略训练的最终目标
+
+    rewards: np.ndarray
+        奖励序列，形状 [batch_size, horizon_length]
+        gc_negative=True:  [-1,...,-1, 0,0,...,0]（达成前惩罚，达成后中性）
+        gc_negative=False: [0,...,0, 1,0,...,0]（仅在达成瞬间奖励）
+        达成后的所有时间步奖励为0，避免干扰学习
+
+    masks: np.ndarray
+        价值目标达成掩码，形状 [batch_size]
+        取值范围 {0.0, 1.0}
+        若在horizon内达成value_goal则masks=0，否则为1
+        用于屏蔽已达成目标的样本对价值函数的影响
+
+    valid: np.ndarray
+        动作时序有效性掩码，形状 [batch_size, horizon_length]
+        取值范围 [0.0, 1.0]
+        在actor_goal达成前（含达成时刻）为1，之后为0
+        用于屏蔽无效动作对演员函数的影响
+
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert "horizon_length" in self.config, "horizon_length未在配置中指定"
+        self.horizon_length = self.config["horizon_length"]
+
+    def sample(
+        self,
+        batch_size: int,
+        idxs: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """采样一个动作块批次，包含完整的分层目标和时序有效性掩码"""
+
+        # 1. 采样起始索引（允许任意位置，后续通过钳位和valid保证有效性）
+        if idxs is None:
+            idxs = self.dataset.get_random_idxs(batch_size)
+
+        # 2. 组装基础批次数据
+        batch = self._assemble_base_batch(idxs)
+
+        # 3. 采样所有目标相关数据和索引
+        goal_data = self._sample_all_goals(idxs)
+        batch.update(goal_data)
+
+        return batch
+
+    def _assemble_base_batch(self, idxs: np.ndarray) -> Dict[str, Any]:
+        """组装基础批次数据：observations, actions, next_observations"""
+        batch = {}
+
+        # 计算轨迹边界索引（向量化）
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+
+        # 起始观测（单帧）
+        batch["observations"] = self.get_observations(idxs)
+
+        # 动作序列索引 [batch, horizon_length]
+        seq_indices = idxs[:, None] + np.arange(self.horizon_length)[None, :]
+        seq_indices_clipped = np.minimum(seq_indices, final_state_idxs[:, None])
+
+        # 安全地获取动作序列 [batch, horizon_length, action_dim]
+        batch["actions"] = self.dataset["actions"][seq_indices_clipped]
+
+        # horizon_length步后的下一观测（用于价值函数）
+        next_idxs = np.minimum(idxs + self.horizon_length, final_state_idxs)
+
+        batch["next_observations"] = self.get_observations(next_idxs)
+
+        return batch
+
+    def _sample_all_goals(self, idxs: np.ndarray) -> Dict[str, Any]:
+        """采样所有目标相关数据和索引"""
+        data = {}
+
+        # 1. 价值目标（复用GCD逻辑）
+        value_goal_idxs = self.sample_goals(
+            idxs,
+            self.config["value_p_curgoal"],
+            self.config["value_p_trajgoal"],
+            self.config["value_p_randomgoal"],
+            self.config["value_geom_sample"],
+        )
+        data["value_goals"] = self.get_observations(value_goal_idxs)
+
+        # 核心：检测value_goal是否在horizon范围内命中
+        # value_goal_hit[i] = True 当且仅当 value_goal_idxs[i] < idxs[i] + horizon_length
+        horizon_limits = idxs + self.horizon_length
+        value_goal_hit = value_goal_idxs < horizon_limits
+
+        # 计算目标相对于起始索引的步数
+        # 对于未命中的样本，设goal_steps = horizon_length（永不触发奖励转换）
+        goal_steps = np.where(
+            value_goal_hit, value_goal_idxs - idxs, self.horizon_length
+        )  # 关键：设为horizon_length，永远大于时间步矩阵
+
+        # 生成时间步矩阵 (1, horizon_length)
+        time_steps = np.arange(self.horizon_length)[None, :]
+
+        # 计算奖励序列
+        if self.config.get("gc_negative", True):
+            # 模式A（惩罚-直到达成）：[-1, -1, ..., -1, 0, 0, ..., 0]
+            # 达成前每一步惩罚，达成后中性
+            data["rewards"] = np.where(time_steps < goal_steps[:, None], -1.0, 0.0)
+        else:
+            # 模式B（稀疏-仅在达成瞬间）：[0, 0, ..., 0, 1, 0, ..., 0]
+            # 只有达成瞬间奖励，其他时间中性（包括达成后）
+            data["rewards"] = np.where(time_steps == goal_steps[:, None], 1.0, 0.0)
+
+        # 计算掩码：只要命中，整个序列都mask掉
+        data["masks"] = 1.0 - value_goal_hit.astype(float)
+
+        # 3. 演员目标（复用sample_goals）
+        actor_goal_idxs = self.sample_goals(
+            idxs,
+            self.config["actor_p_curgoal"],
+            self.config["actor_p_trajgoal"],
+            self.config["actor_p_randomgoal"],
+            self.config["actor_geom_sample"],
+        )
+        data["actor_goals"] = self.get_observations(actor_goal_idxs)
+
+        # 计算演员目标达成的相对步数
+        actor_goal_steps = actor_goal_idxs - idxs
+
+        time_steps = np.arange(self.horizon_length)[None, :]
+
+        # t <= actor_goal_step时有效，否则无效
+        data["valid"] = np.where(time_steps <= actor_goal_steps[:, None], 1.0, 0.0)
+
+        return data
+
+
+@dataclasses.dataclass
 class HGCChunkDataset(HGCDataset):
     """分层目标条件动作块数据集
 
     融合HGCD的分层目标采样与动作块序列采样能力。
     仅支持状态空间数据，返回完整的动作序列和分层目标。
-    批次数据结构（sample_chunk返回）:
+    批次数据结构（sample返回）:
     --------------------------------
     observations: np.ndarray
         起始观测状态，形状 [batch_size, obs_dim]

@@ -15,14 +15,14 @@ from ne_flow.models import (
 )
 
 
-class FlowHIQLAgent(flax.struct.PyTreeNode):
+class NE_Agent(flax.struct.PyTreeNode):
     """
     Flow-HIQL: Hierarchical Implicit Q-Learning with Flow Matching & Action Chunking.
 
     Features:
+    - No DDPG: Purely offline RL via Advantage-Weighted Flow Matching.
     - IQL Value Engine: Single V, Dual Q, Goal-Conditioned.
     - Action Chunking: Low-level policy predicts action sequences.
-    - Cascaded Best-of-N: Hierarchical sampling and ranking.
     - Stateful Inference: Internal buffer management for seamless action chunking.
     """
 
@@ -148,51 +148,8 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
             "q_mean": 0.5 * (q1 + q2).mean(),
         }
 
-    # --- 2. Hierarchical Policy Learning (Weighted Flow Matching) ---
-    def high_actor_loss(self, batch, grad_params, rng):
-        """
-        High-Level Policy: Predicts Subgoal w.
-        Advantage: A = V(w_data, g) - V(s, g)
-        """
-        # 1. Calculate Advantage
-        # V(s, g) - Baseline
-        v_curr = self.network.select("value")(
-            batch["observations"], batch["high_actor_goals"]
-        )
-        # V(w_data, g) - Quality of the data sample
-        # batch['high_actor_targets'] contains the actual subgoals from dataset
-        v_next = self.network.select("value")(
-            batch["high_actor_targets"], batch["high_actor_goals"]
-        )
-
-        adv = v_next - v_curr
-
-        # 2. Calculate AWR Weights
-        weights = jnp.exp(adv * self.config["high_awr_temp"])
-        weights = jnp.clip(weights, max=100.0)
-        weights = jax.lax.stop_gradient(weights)
-
-        # Get Squared Diff [B, Obs_Dim]
-        sq_diff = self.compute_flow_matching_sq_diff(
-            self.network,
-            "high_actor",
-            batch["observations"],
-            batch["high_actor_goals"],
-            batch["high_actor_targets"],
-            rng,
-            grad_params,
-        )
-
-        loss_per_sample = jnp.mean(sq_diff, axis=-1)  # Reduce -> [B]
-        loss = jnp.mean(weights * loss_per_sample)
-
-        return loss, {
-            "high_actor_loss": loss,
-            "high_adv_mean": adv.mean(),
-            "high_weights": weights.mean(),
-        }
-
-    def low_actor_loss(self, batch, grad_params, rng):
+    # --- 2. Weighted Flow Matching ---
+    def actor_loss(self, batch, grad_params, rng):
         """
         Low-Level Policy: Predicts Action Chunk a_t:t+h.
         Advantage: A = Q(s, a_chunk, w) - V(s, w)
@@ -204,28 +161,26 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
 
         # 1. Calculate Advantage
         # V(s, w) - Baseline
-        v = self.network.select("value")(
-            batch["observations"], batch["low_actor_goals"]
-        )
+        v = self.network.select("value")(batch["observations"], batch["actor_goals"])
         # Q(s, a, w) - Quality of the action chunk
         q1, q2 = self.network.select("critic")(
-            batch["observations"], batch["low_actor_goals"], actions
+            batch["observations"], batch["actor_goals"], actions
         )
         q = jnp.minimum(q1, q2)
 
         adv = q - v
 
         # 2. Calculate AWR Weights [B]
-        weights = jnp.exp(adv * self.config["low_awr_temp"])
+        weights = jnp.exp(adv * self.config["awr_temp"])
         weights = jnp.clip(weights, max=100.0)
         weights = jax.lax.stop_gradient(weights)
 
         # 1. Get Squared Diff [B, H*A]
         sq_diff = self.compute_flow_matching_sq_diff(
             self.network,
-            "low_actor",
+            "actor",
             batch["observations"],
-            batch["low_actor_goals"],
+            batch["actor_goals"],
             actions,
             rng,
             grad_params,
@@ -247,16 +202,16 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         loss = jnp.mean(step_weights * loss_per_step)
 
         return loss, {
-            "low_actor_loss": loss,
-            "low_adv_mean": adv.mean(),
-            "low_weights": weights.mean(),
+            "actor_loss": loss,
+            "adv_mean": adv.mean(),
+            "weights": weights.mean(),
         }
 
     # --- 3. Training Loop Boilerplate ---
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
         rng = rng if rng is not None else self.rng
-        rng, high_rng, low_rng = jax.random.split(rng, 3)
+        rng, actor_rng = jax.random.split(rng)
 
         info = {}
 
@@ -270,17 +225,12 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         for k, v in c_info.items():
             info[f"critic/{k}"] = v
 
-        # High Actor Update
-        h_loss, h_info = self.high_actor_loss(batch, grad_params, high_rng)
-        for k, v in h_info.items():
-            info[f"high_actor/{k}"] = v
-
         # Low Actor Update
-        l_loss, l_info = self.low_actor_loss(batch, grad_params, low_rng)
+        l_loss, l_info = self.actor_loss(batch, grad_params, actor_rng)
         for k, v in l_info.items():
-            info[f"low_actor/{k}"] = v
+            info[f"actor/{k}"] = v
 
-        total = v_loss + c_loss + h_loss + l_loss
+        total = v_loss + c_loss + l_loss
         return total, info
 
     def target_update(self, network, module_name):
@@ -312,7 +262,7 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         temperature=1.0,  # Kept for API compatibility, unused
     ):
         """
-        Stateful hierarchical action sampling (non-JIT).
+        Stateful action chunk sampling (non-JIT).
 
         ⚠️ SIDE EFFECTS WARNING:
         - This method modifies internal agent state in-place (via _state dict).
@@ -322,17 +272,12 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         Args:
             observations: [obs_dim] Single observation vector (no batch dim).
             goals: [goal_dim] Single goal vector (no batch dim).
-            seed: PRNG seed for deterministic sampling (required).
+            seed: rng for deterministic sampling (required).
             temperature: Unused, kept for API compatibility.
 
         Returns:
             actions: [action_dim] Single action vector.
         """
-        # Validate seed
-        if seed is None:
-            raise ValueError(
-                "seed must be provided for reproducibility in FlowHIQLAgent.sample_actions"
-            )
 
         # ===== 1. Handle Input Dimensions (Single Environment Only) =====
         # Input: [obs_dim] -> Internal: [1, obs_dim]
@@ -354,10 +299,8 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
                 # Task has changed! Reset internal state.
                 horizon = self.config["horizon_length"]
                 action_dim = self.config["action_dim"]
-                obs_dim = self.config["obs_dim"]
                 state["action_chunk_buffer"] = jnp.zeros((1, horizon, action_dim))
                 state["chunk_step_idx"] = 0
-                state["current_subgoal"] = jnp.zeros((1, obs_dim))
 
         # Update previous goal reference
         state["prev_goal"] = goal
@@ -366,17 +309,9 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         needs_replan = state["chunk_step_idx"] >= self.config["horizon_length"]
 
         if needs_replan:
-            # Generate new subgoal and action chunk
-            rng, high_rng, low_rng = jax.random.split(seed, 3)
-
-            # Sample new subgoal
-            state["current_subgoal"] = self.sample_high_actions(
-                observations=obs, goals=goal, rng=high_rng
-            )  # [1, obs_dim]
-
             # Sample new action chunk
             action_chunk_flat = self.sample_low_actions(
-                observations=obs, subgoals=state["current_subgoal"], rng=low_rng
+                observations=obs, goals=goal, rng=seed
             )  # [1, H*A]
 
             # Reshape and store: [1, H*A] -> [1, H, A]
@@ -400,19 +335,16 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         # Return [A] without batch dimension
         return current_action[0]
 
-    # --- 5. Cascaded Best-of-N Sampling (JIT-compiled) ---
+    # --- 5. Best-of-N Sampling (JIT-compiled) ---
     @partial(jax.jit, static_argnames=("module_name", "out_dim", "num_samples"))
     def sample_flow_actions(self, module_name, obs, goal, out_dim, num_samples, rng):
         """Helper: Generate N samples from a conditional flow model."""
-        # Setup dimensions for broadcasting
         batch_size = obs.shape[0]
         obs_rep = jnp.repeat(obs[:, None, :], num_samples, axis=1)
         goal_rep = jnp.repeat(goal[:, None, :], num_samples, axis=1)
 
-        # Initial Noise x0
         x = jax.random.normal(rng, (batch_size, num_samples, out_dim))
 
-        # Euler Integration
         steps = self.config["flow_steps"]
         dt = 1.0 / steps
         for i in range(steps):
@@ -425,50 +357,17 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         return x
 
     @jax.jit
-    def sample_high_actions(self, observations, goals, rng=None):
+    def sample_low_actions(self, observations, goals, rng):
         """
-        Sample subgoals using Best-of-N.
-        Returns: [B, subgoal_dim]
-        """
-        rng = rng if rng is not None else self.rng
-        rng, high_rng = jax.random.split(rng)
-
-        N = self.config["high_num_samples"]
-        subgoal_dim = observations.shape[-1]
-
-        candidate_subgoals = self.sample_flow_actions(
-            "high_actor", observations, goals, subgoal_dim, N, high_rng
-        )  # [B, N, subgoal_dim]
-
-        # Evaluate with V(w, g)
-        flat_obs = candidate_subgoals.reshape(-1, subgoal_dim)
-        flat_goals = jnp.repeat(goals[:, None, :], N, axis=1).reshape(
-            -1, goals.shape[-1]
-        )
-
-        flat_scores = self.network.select("value")(flat_obs, flat_goals)
-        scores = flat_scores.reshape(observations.shape[0], N)
-
-        # Select Best Subgoal
-        best_idx = jnp.argmax(scores, axis=1)
-        best_subgoals = candidate_subgoals[jnp.arange(len(best_idx)), best_idx]
-
-        return best_subgoals
-
-    @jax.jit
-    def sample_low_actions(self, observations, subgoals, rng=None):
-        """
-        Sample action chunks using Best-of-N.
+        Low-Level Action Chunk Sampling given Goals.
         Returns: [B, H*A]
         """
-        rng = rng if rng is not None else self.rng
-        rng, low_rng = jax.random.split(rng)
-
         N = self.config["low_num_samples"]
         action_dim = self.config["action_dim"] * self.config["horizon_length"]
+        subgoal_dim = observations.shape[-1]
 
         candidate_actions = self.sample_flow_actions(
-            "low_actor", observations, subgoals, action_dim, N, low_rng
+            "actor", observations, goals, action_dim, N, rng
         )  # [B, N, H*A]
         candidate_actions = jnp.clip(candidate_actions, -1.0, 1.0)
 
@@ -476,8 +375,8 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         flat_obs = jnp.repeat(observations[:, None, :], N, axis=1).reshape(
             -1, observations.shape[-1]
         )
-        flat_subgoals = jnp.repeat(subgoals[:, None, :], N, axis=1).reshape(
-            -1, subgoals.shape[-1]
+        flat_subgoals = jnp.repeat(goals[:, None, :], N, axis=1).reshape(
+            -1, subgoal_dim
         )
         flat_actions = candidate_actions.reshape(-1, action_dim)
 
@@ -496,7 +395,6 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng)
 
-        obs_dim = ex_observations.shape[-1]
         action_dim = ex_actions.shape[-1]
         # Action Chunk dim
         full_action_dim = action_dim * (
@@ -522,13 +420,7 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
             ensemble=True,
             gc_encoder=None,
         )
-        high_actor_def = GCFlowActor(
-            hidden_dims=config["actor_hidden_dims"],
-            action_dim=obs_dim,
-            layer_norm=config["layer_norm"],
-            gc_encoder=None,
-        )
-        low_actor_def = GCFlowActor(
+        actor_def = GCFlowActor(
             hidden_dims=config["actor_hidden_dims"],
             action_dim=full_action_dim,
             layer_norm=config["layer_norm"],
@@ -542,12 +434,8 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
                 copy.deepcopy(critic_def),
                 (ex_observations, ex_goals, ex_full_actions),
             ),
-            high_actor=(
-                high_actor_def,
-                (ex_observations, ex_goals, ex_subgoals, ex_time),
-            ),
-            low_actor=(
-                low_actor_def,
+            actor=(
+                actor_def,
                 (ex_observations, ex_subgoals, ex_full_actions, ex_time),
             ),
         )
@@ -564,7 +452,7 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         params["modules_target_critic"] = params["modules_critic"]
 
         # Store dimensions for inference buffer initialization
-        config["obs_dim"] = obs_dim
+        config["obs_dim"] = ex_observations.shape[-1]
         config["action_dim"] = action_dim  # Raw action dim
 
         # Initialize stateful inference buffers in a mutable dict
@@ -574,7 +462,6 @@ class FlowHIQLAgent(flax.struct.PyTreeNode):
         inference_state = {
             "action_chunk_buffer": jnp.zeros((batch_size, horizon, action_dim)),
             "chunk_step_idx": 0,
-            "current_subgoal": jnp.zeros((batch_size, obs_dim)),
             "prev_goal": None,
         }
 
@@ -592,40 +479,37 @@ def get_config():
             agent_name="neflow",
             lr=3e-4,
             batch_size=1024,
-            actor_hidden_dims=(512, 512, 512),
-            value_hidden_dims=(512, 512, 512),
+            actor_hidden_dims=(512, 512, 512, 512),
+            value_hidden_dims=(512, 512, 512, 512),
             layer_norm=True,
             discount=0.99,
             tau=0.005,
             # IQL Params
-            expectile=0.9,
-            # Hierarchical Params
-            subgoal_steps=10,
+            expectile=0.9,  # IQL Expectile (0.7-0.9 is standard)
+            subgoal_steps=20,  # unused
             discrete=False,  # unused
             # Dataset Params
-            dataset_class="HGCChunkDataset",
-            value_p_curgoal=0.2,
-            value_p_trajgoal=0.5,
-            value_p_randomgoal=0.3,
-            value_geom_sample=True,
-            actor_p_curgoal=0.0,
-            actor_p_trajgoal=1.0,
-            actor_p_randomgoal=0.0,
-            actor_geom_sample=False,
-            gc_negative=True,
+            dataset_class="GCChunkDataset",
+            value_p_curgoal=0.2,  # Probability of using the current state as the value goal.
+            value_p_trajgoal=0.5,  # Probability of using a future state in the same trajectory as the value goal.
+            value_p_randomgoal=0.3,  # Probability of using a random state as the value goal.
+            value_geom_sample=True,  # Whether to use geometric sampling for future value goals.
+            actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
+            actor_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the actor goal.
+            actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
+            actor_geom_sample=False,  # Whether to use geometric sampling for future actor goals.
+            gc_negative=True,  # Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as reward.
             # Flow / AWR Params
-            flow_steps=10,
-            high_awr_temp=3.0,
-            low_awr_temp=3.0,
+            flow_steps=10,  # ODE Integration steps
+            awr_temp=3.0,  # AWR 温度 (越大区分度越高，但也越不稳定)
             # Chunking Params
             action_chunking=True,
-            horizon_length=5,
-            # Inference Params
-            high_num_samples=32,
-            low_num_samples=32,
+            horizon_length=8,  # Chunk size
+            # Inference Params (Best-of-N)
+            low_num_samples=32,  # Samples for action chunk
             # Misc
             encoder=None,
-            frame_stack=ml_collections.config_dict.placeholder(int),
+            frame_stack=ml_collections.config_dict.placeholder(int),  # unused
         )
     )
     return config
