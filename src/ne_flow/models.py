@@ -186,11 +186,6 @@ encoder_modules = {
 }
 
 
-def default_init(scale=1.0):
-    """Default kernel initializer."""
-    return nn.initializers.variance_scaling(scale, "fan_avg", "uniform")
-
-
 def ensemblize(cls, num_qs, out_axes=0, **kwargs):
     """Ensemblize a module."""
     return nn.vmap(
@@ -504,6 +499,147 @@ class GCValue(nn.Module):
         v = self.value_net(inputs).squeeze(-1)
 
         return v
+
+
+class FiLM1DBlock(nn.Module):
+    """
+    基础组件：受Context调制的1D卷积块
+    Conv1D -> FiLM -> Activation -> LayerNorm
+    """
+
+    features: int
+    kernel_size: int = 3
+    activations: Any = nn.gelu
+    layer_norm: bool = True  # 默认开启，对 IQL 稳定性很重要
+
+    @nn.compact
+    def __call__(self, x, context):
+        # x: [Batch, Time, Channels] (Action stream)
+        # context: [Batch, Embed_Dim] (State stream)
+
+        # 1. 提取时序特征
+        x = nn.Conv(
+            features=self.features,
+            kernel_size=(self.kernel_size,),
+            padding="SAME",
+            kernel_init=default_init(),
+        )(x)
+
+        # 2. 生成 FiLM 参数 (Gamma, Beta)
+        # 将 context 映射到 2 * features
+        stats = nn.Dense(self.features * 2, kernel_init=default_init())(context)
+        gamma, beta = jnp.split(stats, 2, axis=-1)
+
+        # 扩展维度以匹配时间轴: [B, F] -> [B, 1, F]
+        gamma = jnp.expand_dims(gamma, axis=1)
+        beta = jnp.expand_dims(beta, axis=1)
+
+        # 3. 执行调制 (Affine)
+        x = (1.0 + gamma) * x + beta
+
+        # 4. 激活与归一化
+        x = self.activations(x)
+        if self.layer_norm:
+            x = nn.LayerNorm()(x)
+
+        return x
+
+
+class ChunkCriticNetwork(nn.Module):
+    """
+    核心网络逻辑：
+    Context(s, g) --> MLP --+--> FiLM调制
+                            |
+    Actions(a_chunk) -----> ConvStack --> Flatten --> Concat --> MLP Head -> Q
+    """
+
+    hidden_dims: Sequence[int]  # MLP Head 的层宽
+    conv_dims: Sequence[int]  # 卷积层的通道数配置
+    layer_norm: bool = True
+    activations: Any = nn.gelu
+
+    @nn.compact
+    def __call__(self, observations, goals, actions):
+        # 1. 构建 Context (Obs + Goal)
+        if goals is not None:
+            context_input = jnp.concatenate([observations, goals], axis=-1)
+        else:
+            context_input = observations
+
+        # 将 Context 嵌入到一个适合调制的大小 (取 conv_dims[-1] 或 hidden_dims[0] 均可，这里用 256)
+        # 这层必须存在，用于特征对齐
+        context = nn.Dense(256, kernel_init=default_init())(context_input)
+        context = self.activations(context)
+        if self.layer_norm:
+            context = nn.LayerNorm()(context)
+
+        # 2. 处理动作块 (Action Chunk Stream)
+        # 确保 actions 是 3D 的 [Batch, Horizon, Act_Dim]
+        x = actions
+
+        # 堆叠 FiLM 卷积块
+        for features in self.conv_dims:
+            x = FiLM1DBlock(
+                features=features,
+                layer_norm=self.layer_norm,
+                activations=self.activations,
+            )(x, context)
+
+        # 3. 融合
+        # 展平时间维: [B, H, C] -> [B, H*C]
+        x = x.reshape((x.shape[0], -1))
+
+        # 再次拼接 Context (Skip Connection)，增强梯度流动
+        x = jnp.concatenate([x, context], axis=-1)
+
+        # 4. MLP Head 输出 Q 值
+        x = MLP(
+            self.hidden_dims,
+            activate_final=True,
+            layer_norm=self.layer_norm,
+            activations=self.activations,
+        )(x)
+
+        q = nn.Dense(1, kernel_init=default_init())(x)
+        return q.squeeze(-1)
+
+
+class GCChunkCritic(nn.Module):
+    """
+    对外接口类：专门用于 Action Chunking 的 Critic。
+    替代 GCValue 用于 Critic 部分。
+    """
+
+    hidden_dims: Sequence[int] = (256, 256)
+    conv_dims: Sequence[int] = (64, 128, 256)  # 推荐配置
+    layer_norm: bool = True
+    ensemble: bool = True
+    # gc_encoder 保留但不使用，为了维持 config 结构的兼容性
+    gc_encoder: nn.Module = None
+
+    def setup(self):
+        # 配置内部网络
+        config = {
+            "hidden_dims": self.hidden_dims,
+            "conv_dims": self.conv_dims,
+            "layer_norm": self.layer_norm,
+        }
+
+        if self.ensemble:
+            ChunkCriticClass = ensemblize(ChunkCriticNetwork, 2)
+            self.net = ChunkCriticClass(**config)
+        else:
+            self.net = ChunkCriticNetwork(**config)
+
+    def __call__(self, observations, goals, actions):
+        """
+        显式要求传入 actions
+        参数:
+            observations: [B, Obs_Dim]
+            goals: [B, Goal_Dim]
+            actions: [B, Horizon, Act_Dim] (必须是分块后的形状)
+        """
+        return self.net(observations, goals, actions)
 
 
 class GCDiscreteCritic(GCValue):
