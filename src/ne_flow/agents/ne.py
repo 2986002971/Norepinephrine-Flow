@@ -8,11 +8,7 @@ import ml_collections
 import optax
 
 from ne_flow.flax_utils import ModuleDict, TrainState, nonpytree_field
-from ne_flow.models import (
-    GCChunkCritic,
-    GCUnet,
-    GCValue,
-)
+from ne_flow.models import GCChunkCritic, GCGeometricValue, GCUnet
 
 
 class NE_Agent(flax.struct.PyTreeNode):
@@ -387,7 +383,7 @@ class NE_Agent(flax.struct.PyTreeNode):
 
         # Networks Definition
         # V: MLP (GCValue)
-        value_def = GCValue(
+        value_def = GCGeometricValue(
             hidden_dims=config["value_hidden_dims"],
             layer_norm=config["layer_norm"],
             ensemble=False,
@@ -397,7 +393,7 @@ class NE_Agent(flax.struct.PyTreeNode):
         # [Modify] Critic: Conv + FiLM (GCChunkCritic)
         critic_def = GCChunkCritic(
             hidden_dims=config["value_hidden_dims"],
-            conv_dims=(64, 128, 256),  # 根据 H=8 调整
+            conv_dims=(64, 128, 256),
             layer_norm=config["layer_norm"],
             ensemble=True,
             gc_encoder=None,
