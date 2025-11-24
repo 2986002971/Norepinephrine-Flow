@@ -626,7 +626,7 @@ class GCChunkDataset(GCDataset):
 
 
 @dataclasses.dataclass
-class HGCChunkDataset(HGCDataset):  # TODO: 待修正奖励逻辑
+class HGCChunkDataset(HGCDataset):
     """分层目标条件动作块数据集
 
     融合HGCD的分层目标采样与动作块序列采样能力。
@@ -693,146 +693,124 @@ class HGCChunkDataset(HGCDataset):  # TODO: 待修正奖励逻辑
     ) -> Dict[str, Any]:
         """采样一个动作块批次，包含完整的分层目标和时序有效性掩码"""
 
-        # 1. 采样起始索引（允许任意位置，后续通过钳位和valid保证有效性）
+        # 1. 采样起始索引
         if idxs is None:
             idxs = self.dataset.get_random_idxs(batch_size)
 
-        # 2. 组装基础批次数据
+        # 2. 组装基础批次数据 (返回 final_state_idxs 供后续使用)
         batch = self._assemble_base_batch(idxs)
 
-        # 3. 采样所有目标相关数据和索引
+        # 3. 采样所有目标、计算奖励与掩码 (核心逻辑)
         goal_data = self._sample_all_goals(idxs)
         batch.update(goal_data)
 
-        # 4. 计算奖励序列（基于value_goal达成时间）
-        batch["rewards"], batch["masks"] = self._compute_reward_and_mask(
-            idxs, batch["value_goal_idxs"]
-        )
-
-        # 5. 计算时序有效性掩码（基于low_actor_goal达成时间）
-        batch["valid"] = self._compute_valid_sequence(idxs, batch["low_goal_idxs"])
-
-        # 6. 清理内部索引字段
-        batch.pop("value_goal_idxs")
-        batch.pop("low_goal_idxs")
-        batch.pop("high_goal_idxs")
-        batch.pop("high_target_idxs")
-
         return batch
 
-    def _assemble_base_batch(self, idxs: np.ndarray) -> Dict[str, Any]:
+    def _assemble_base_batch(
+        self, idxs: np.ndarray
+    ) -> Tuple[Dict[str, Any], np.ndarray]:
         """组装基础批次数据：observations, actions, next_observations"""
         batch = {}
 
         # 计算轨迹边界索引（向量化）
         final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
 
-        # 起始观测（单帧）
+        # 起始观测
         batch["observations"] = self.get_observations(idxs)
 
         # 动作序列索引 [batch, horizon_length]
+        # 钳位到轨迹终点，防止跨轨迹读取动作
         seq_indices = idxs[:, None] + np.arange(self.horizon_length)[None, :]
         seq_indices_clipped = np.minimum(seq_indices, final_state_idxs[:, None])
 
-        # 安全地获取动作序列 [batch, horizon_length, action_dim]
+        # 获取动作序列 [batch, horizon_length, action_dim]
         batch["actions"] = self.dataset["actions"][seq_indices_clipped]
 
         # horizon_length步后的下一观测（用于价值函数）
+        # 同样钳位到轨迹终点
         next_idxs = np.minimum(idxs + self.horizon_length, final_state_idxs)
-
         batch["next_observations"] = self.get_observations(next_idxs)
 
         return batch
 
     def _sample_all_goals(self, idxs: np.ndarray) -> Dict[str, Any]:
-        """采样所有目标相关数据和索引"""
+        """采样所有目标相关数据，并计算奖励、掩码和有效性"""
         data = {}
 
-        # 计算轨迹边界
-        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
-
-        # 1. 价值目标（复用HGCD逻辑）
-        data["value_goal_idxs"] = self.sample_goals(
+        # ==========================================
+        # 1. 价值目标 (Value Goals) & 奖励计算 (Rewards)
+        # ==========================================
+        value_goal_idxs = self.sample_goals(
             idxs,
             self.config["value_p_curgoal"],
             self.config["value_p_trajgoal"],
             self.config["value_p_randomgoal"],
             self.config["value_geom_sample"],
         )
-        data["value_goals"] = self.get_observations(data["value_goal_idxs"])
+        data["value_goals"] = self.get_observations(value_goal_idxs)
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
 
-        # 2. 低层演员目标（固定步长）
-        data["low_goal_idxs"] = np.minimum(
+        # --- [BUG FIX] 严谨的命中判定 ---
+        # 必须同时满足：1.未来时刻 2.在Horizon内 3.在同一条轨迹内
+        is_future = value_goal_idxs >= idxs
+        horizon_limits = idxs + self.horizon_length
+        in_horizon = value_goal_idxs < horizon_limits
+        same_traj = value_goal_idxs <= final_state_idxs
+
+        value_goal_hit = is_future & in_horizon & same_traj
+        # -----------------------------------
+
+        # 计算目标相对步数 (未命中设为 horizon_length)
+        goal_steps = np.where(
+            value_goal_hit, value_goal_idxs - idxs, self.horizon_length
+        )
+
+        # 生成奖励序列
+        time_steps = np.arange(self.horizon_length)[None, :]
+        if self.config.get("gc_negative", True):
+            # 模式A：达成前 -1，达成后 0
+            data["rewards"] = np.where(time_steps < goal_steps[:, None], -1.0, 0.0)
+        else:
+            # 模式B：达成瞬间 1，其余 0
+            data["rewards"] = np.where(time_steps == goal_steps[:, None], 1.0, 0.0)
+
+        # 计算 Value Mask (命中则屏蔽后续价值估计)
+        data["masks"] = 1.0 - value_goal_hit.astype(float)
+
+        # ==========================================
+        # 2. 低层演员目标 (Low-Level Actor Goals) & 有效性
+        # ==========================================
+        # 低层目标通常是固定步长 (subgoal_steps)
+        low_goal_idxs = np.minimum(
             idxs + self.config["subgoal_steps"], final_state_idxs
         )
-        data["low_actor_goals"] = self.get_observations(data["low_goal_idxs"])
+        data["low_actor_goals"] = self.get_observations(low_goal_idxs)
 
-        # 3. 高层演员目标（复用sample_goals）
-        data["high_goal_idxs"] = self.sample_goals(
+        # 计算有效性掩码 (Valid Mask)
+        # 逻辑：在到达 low_actor_goal 之前(含)的动作是有效的，之后无效
+        # 注意：这里我们假设 low_goal 肯定是在同一条轨迹内的(因为上面用了minimum钳位)
+        low_steps = low_goal_idxs - idxs
+        data["valid"] = np.where(time_steps <= low_steps[:, None], 1.0, 0.0)
+
+        # ==========================================
+        # 3. 高层演员目标 (High-Level Actor Goals)
+        # ==========================================
+        high_goal_idxs = self.sample_goals(
             idxs,
             self.config["actor_p_curgoal"],
             self.config["actor_p_trajgoal"],
             self.config["actor_p_randomgoal"],
             self.config["actor_geom_sample"],
         )
-        data["high_actor_goals"] = self.get_observations(data["high_goal_idxs"])
+        data["high_actor_goals"] = self.get_observations(high_goal_idxs)
 
-        # 高层目标预测目标（双重钳位：不超过high_goal，不超出轨迹边界）
+        # 高层预测目标 (High Target):
+        # 用于监督高层策略预测"低层策略最终会到达哪里"
+        # 逻辑：取 (当前+步长) 和 (最终高层目标) 之间的较小值，再被轨迹终点钳位
         high_target_candidate = np.minimum(
-            idxs + self.config["subgoal_steps"], data["high_goal_idxs"]
+            idxs + self.config["subgoal_steps"], high_goal_idxs
         )
-        data["high_target_idxs"] = np.minimum(high_target_candidate, final_state_idxs)
-        data["high_actor_targets"] = self.get_observations(data["high_target_idxs"])
+        high_target_idxs = np.minimum(high_target_candidate, final_state_idxs)
+        data["high_actor_targets"] = self.get_observations(high_target_idxs)
 
         return data
-
-    def _compute_reward_and_mask(
-        self, idxs: np.ndarray, value_goal_idxs: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """统一计算奖励序列和掩码"""
-        # 核心：检测value_goal是否在horizon范围内命中
-        # value_goal_hit[i] = True 当且仅当 value_goal_idxs[i] < idxs[i] + horizon_length
-        horizon_limits = idxs + self.horizon_length
-        value_goal_hit = value_goal_idxs < horizon_limits
-
-        # 计算目标相对于起始索引的步数
-        # 对于未命中的样本，设goal_steps = horizon_length（永不触发奖励转换）
-        goal_steps = np.where(
-            value_goal_hit, value_goal_idxs - idxs, self.horizon_length
-        )  # 关键：设为horizon_length，永远大于时间步矩阵
-
-        # 生成时间步矩阵 (1, horizon_length)
-        time_steps = np.arange(self.horizon_length)[None, :]
-
-        # 计算奖励序列
-        if self.config.get("gc_negative", True):
-            # 模式A（惩罚-直到达成）：[-1, -1, ..., -1, 0, 0, ..., 0]
-            # 达成前每一步惩罚，达成后中性
-            rewards = np.where(time_steps < goal_steps[:, None], -1.0, 0.0)
-        else:
-            # 模式B（稀疏-仅在达成瞬间）：[0, 0, ..., 0, 1, 0, ..., 0]
-            # 只有达成瞬间奖励，其他时间中性（包括达成后）
-            rewards = np.where(time_steps == goal_steps[:, None], 1.0, 0.0)
-
-        # 计算掩码：只要命中，整个序列都mask掉
-        masks = 1.0 - value_goal_hit.astype(float)
-
-        return rewards, masks
-
-    def _compute_valid_sequence(
-        self, idxs: np.ndarray, low_goal_idxs: np.ndarray
-    ) -> np.ndarray:
-        """计算时序有效性掩码 [batch, horizon_length]
-
-        逻辑：low_actor_goal达成前及达成时刻动作有效，达成后无效
-        """
-        # 计算低层目标达成的相对步数
-        low_steps = low_goal_idxs - idxs
-
-        # 生成时间步矩阵 [batch, horizon_length]
-        time_steps = np.arange(self.horizon_length)[None, :]
-
-        # t <= low_step时有效，否则无效
-        valid = np.where(time_steps <= low_steps[:, None], 1.0, 0.0)
-
-        return valid
