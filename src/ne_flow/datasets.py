@@ -567,10 +567,20 @@ class GCChunkDataset(GCDataset):
         )
         data["value_goals"] = self.get_observations(value_goal_idxs)
 
-        # 核心：检测value_goal是否在horizon范围内命中
-        # value_goal_hit[i] = True 当且仅当 value_goal_idxs[i] < idxs[i] + horizon_length
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+
+        # 1. 判定是否是未来时刻
+        is_future = value_goal_idxs >= idxs
+
+        # 2. 判定是否在 Horizon 范围内
         horizon_limits = idxs + self.horizon_length
-        value_goal_hit = value_goal_idxs < horizon_limits
+        in_horizon = value_goal_idxs < horizon_limits
+
+        # 3. 判定是否在同一条轨迹 (目标索引不能超过当前轨迹的终点)
+        same_traj = value_goal_idxs <= final_state_idxs
+
+        # 综合判定
+        value_goal_hit = is_future & in_horizon & same_traj
 
         # 计算目标相对于起始索引的步数
         # 对于未命中的样本，设goal_steps = horizon_length（永不触发奖励转换）
@@ -616,7 +626,7 @@ class GCChunkDataset(GCDataset):
 
 
 @dataclasses.dataclass
-class HGCChunkDataset(HGCDataset):
+class HGCChunkDataset(HGCDataset):  # TODO: 待修正奖励逻辑
     """分层目标条件动作块数据集
 
     融合HGCD的分层目标采样与动作块序列采样能力。
