@@ -1,6 +1,6 @@
 import dataclasses
 from functools import partial
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import jax
 import jax.numpy as jnp
@@ -521,16 +521,6 @@ class GCChunkDataset(GCDataset):
             idxs = self.dataset.get_random_idxs(batch_size)
 
         # 2. 组装基础批次数据
-        batch = self._assemble_base_batch(idxs)
-
-        # 3. 采样所有目标相关数据和索引
-        goal_data = self._sample_all_goals(idxs)
-        batch.update(goal_data)
-
-        return batch
-
-    def _assemble_base_batch(self, idxs: np.ndarray) -> Dict[str, Any]:
-        """组装基础批次数据：observations, actions, next_observations"""
         batch = {}
 
         # 计算轨迹边界索引（向量化）
@@ -551,12 +541,6 @@ class GCChunkDataset(GCDataset):
 
         batch["next_observations"] = self.get_observations(next_idxs)
 
-        return batch
-
-    def _sample_all_goals(self, idxs: np.ndarray) -> Dict[str, Any]:
-        """采样所有目标相关数据和索引"""
-        data = {}
-
         # 1. 价值目标（复用GCD逻辑）
         value_goal_idxs = self.sample_goals(
             idxs,
@@ -565,11 +549,7 @@ class GCChunkDataset(GCDataset):
             self.config["value_p_randomgoal"],
             self.config["value_geom_sample"],
         )
-        data["value_goals"] = self.get_observations(value_goal_idxs)
-
-        final_state_idxs = self.terminal_locs[
-            np.searchsorted(self.terminal_locs, idxs)
-        ]  # TODO: 合并函数减少一次计算
+        batch["value_goals"] = self.get_observations(value_goal_idxs)
 
         # 1. 判定是否是未来时刻
         is_future = value_goal_idxs >= idxs
@@ -597,14 +577,14 @@ class GCChunkDataset(GCDataset):
         if self.config.get("gc_negative", True):
             # 模式A（惩罚-直到达成）：[-1, -1, ..., -1, 0, 0, ..., 0]
             # 达成前每一步惩罚，达成后中性
-            data["rewards"] = np.where(time_steps < goal_steps[:, None], -1.0, 0.0)
+            batch["rewards"] = np.where(time_steps < goal_steps[:, None], -1.0, 0.0)
         else:
             # 模式B（稀疏-仅在达成瞬间）：[0, 0, ..., 0, 1, 0, ..., 0]
             # 只有达成瞬间奖励，其他时间中性（包括达成后）
-            data["rewards"] = np.where(time_steps == goal_steps[:, None], 1.0, 0.0)
+            batch["rewards"] = np.where(time_steps == goal_steps[:, None], 1.0, 0.0)
 
         # 计算掩码：只要命中，整个序列都mask掉
-        data["masks"] = 1.0 - value_goal_hit.astype(float)
+        batch["masks"] = 1.0 - value_goal_hit.astype(float)
 
         # 3. 演员目标（复用sample_goals）
         actor_goal_idxs = self.sample_goals(
@@ -614,7 +594,7 @@ class GCChunkDataset(GCDataset):
             self.config["actor_p_randomgoal"],
             self.config["actor_geom_sample"],
         )
-        data["actor_goals"] = self.get_observations(actor_goal_idxs)
+        batch["actor_goals"] = self.get_observations(actor_goal_idxs)
 
         # 计算演员目标达成的相对步数
         actor_goal_steps = actor_goal_idxs - idxs
@@ -622,9 +602,9 @@ class GCChunkDataset(GCDataset):
         time_steps = np.arange(self.horizon_length)[None, :]
 
         # t <= actor_goal_step时有效，否则无效
-        data["valid"] = np.where(time_steps <= actor_goal_steps[:, None], 1.0, 0.0)
+        batch["valid"] = np.where(time_steps <= actor_goal_steps[:, None], 1.0, 0.0)
 
-        return data
+        return batch
 
 
 @dataclasses.dataclass
@@ -699,19 +679,6 @@ class HGCChunkDataset(HGCDataset):
         if idxs is None:
             idxs = self.dataset.get_random_idxs(batch_size)
 
-        # 2. 组装基础批次数据 (返回 final_state_idxs 供后续使用)
-        batch = self._assemble_base_batch(idxs)
-
-        # 3. 采样所有目标、计算奖励与掩码 (核心逻辑)
-        goal_data = self._sample_all_goals(idxs)
-        batch.update(goal_data)
-
-        return batch
-
-    def _assemble_base_batch(
-        self, idxs: np.ndarray
-    ) -> Tuple[Dict[str, Any], np.ndarray]:
-        """组装基础批次数据：observations, actions, next_observations"""
         batch = {}
 
         # 计算轨迹边界索引（向量化）
@@ -733,12 +700,6 @@ class HGCChunkDataset(HGCDataset):
         next_idxs = np.minimum(idxs + self.horizon_length, final_state_idxs)
         batch["next_observations"] = self.get_observations(next_idxs)
 
-        return batch
-
-    def _sample_all_goals(self, idxs: np.ndarray) -> Dict[str, Any]:
-        """采样所有目标相关数据，并计算奖励、掩码和有效性"""
-        data = {}
-
         # ==========================================
         # 1. 价值目标 (Value Goals) & 奖励计算 (Rewards)
         # ==========================================
@@ -749,10 +710,7 @@ class HGCChunkDataset(HGCDataset):
             self.config["value_p_randomgoal"],
             self.config["value_geom_sample"],
         )
-        data["value_goals"] = self.get_observations(value_goal_idxs)
-        final_state_idxs = self.terminal_locs[
-            np.searchsorted(self.terminal_locs, idxs)
-        ]  # TODO: 合并函数减少一次计算
+        batch["value_goals"] = self.get_observations(value_goal_idxs)
 
         # --- [BUG FIX] 严谨的命中判定 ---
         # 必须同时满足：1.未来时刻 2.在Horizon内 3.在同一条轨迹内
@@ -773,28 +731,31 @@ class HGCChunkDataset(HGCDataset):
         time_steps = np.arange(self.horizon_length)[None, :]
         if self.config.get("gc_negative", True):
             # 模式A：达成前 -1，达成后 0
-            data["rewards"] = np.where(time_steps < goal_steps[:, None], -1.0, 0.0)
+            batch["rewards"] = np.where(time_steps < goal_steps[:, None], -1.0, 0.0)
         else:
             # 模式B：达成瞬间 1，其余 0
-            data["rewards"] = np.where(time_steps == goal_steps[:, None], 1.0, 0.0)
+            batch["rewards"] = np.where(time_steps == goal_steps[:, None], 1.0, 0.0)
 
         # 计算 Value Mask (命中则屏蔽后续价值估计)
-        data["masks"] = 1.0 - value_goal_hit.astype(float)
+        batch["masks"] = 1.0 - value_goal_hit.astype(float)
 
         # ==========================================
         # 2. 低层演员目标 (Low-Level Actor Goals) & 有效性
         # ==========================================
-        # 低层目标通常是固定步长 (subgoal_steps)
-        low_goal_idxs = np.minimum(
-            idxs + self.config["subgoal_steps"], final_state_idxs
-        )
-        data["low_actor_goals"] = self.get_observations(low_goal_idxs)
+        max_step = self.config["subgoal_steps"]
+        min_step = 1  # 至少往未来看1步
+
+        random_offsets = np.random.randint(
+            min_step, max_step + 1, size=len(idxs)
+        )  # randint 生成 [min, max) 所以上限要 +1
+        low_goal_idxs = np.minimum(idxs + random_offsets, final_state_idxs)
+        batch["low_actor_goals"] = self.get_observations(low_goal_idxs)
 
         # 计算有效性掩码 (Valid Mask)
         # 逻辑：在到达 low_actor_goal 之前(含)的动作是有效的，之后无效
         # 注意：这里我们假设 low_goal 肯定是在同一条轨迹内的(因为上面用了minimum钳位)
         low_steps = low_goal_idxs - idxs
-        data["valid"] = np.where(time_steps <= low_steps[:, None], 1.0, 0.0)
+        batch["valid"] = np.where(time_steps <= low_steps[:, None], 1.0, 0.0)
 
         # ==========================================
         # 3. 高层演员目标 (High-Level Actor Goals)
@@ -806,7 +767,7 @@ class HGCChunkDataset(HGCDataset):
             self.config["actor_p_randomgoal"],
             self.config["actor_geom_sample"],
         )
-        data["high_actor_goals"] = self.get_observations(high_goal_idxs)
+        batch["high_actor_goals"] = self.get_observations(high_goal_idxs)
 
         # 高层预测目标 (High Target):
         # 用于监督高层策略预测"低层策略最终会到达哪里"
@@ -815,6 +776,6 @@ class HGCChunkDataset(HGCDataset):
             idxs + self.config["subgoal_steps"], high_goal_idxs
         )
         high_target_idxs = np.minimum(high_target_candidate, final_state_idxs)
-        data["high_actor_targets"] = self.get_observations(high_target_idxs)
+        batch["high_actor_targets"] = self.get_observations(high_target_idxs)
 
-        return data
+        return batch

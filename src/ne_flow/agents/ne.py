@@ -491,8 +491,8 @@ class NE_Agent(flax.struct.PyTreeNode):
         flat_actions = candidate_actions.reshape(-1, action_dim)
 
         q1, q2 = self.network.select("critic")(flat_obs, flat_subgoals, flat_actions)
-        flat_q = (q1 + q2) / 2
-        q_scores = flat_q.reshape(observations.shape[0], N)
+        q_min = jnp.minimum(q1, q2)
+        q_scores = q_min.reshape(observations.shape[0], N)
 
         top_k_scores, top_k_indices = jax.lax.top_k(q_scores, K)  # [B, K]
         # Gather top-k actions: [B, K, H*A]
@@ -614,7 +614,7 @@ def get_config():
             # IQL Params
             expectile=0.9,
             # Hierarchical Params
-            subgoal_steps=10,
+            subgoal_steps=25,
             low_top_k=4,
             high_top_k=4,
             discrete=False,  # unused
