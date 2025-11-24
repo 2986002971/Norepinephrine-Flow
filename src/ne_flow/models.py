@@ -501,125 +501,6 @@ class GCValue(nn.Module):
         return v
 
 
-class SymetricStateEncoder(nn.Module):
-    """
-    专门处理同构状态空间 (s, g) 的编码器。
-    利用了 Siamese 结构和几何差分特征。
-    """
-
-    hidden_dim: int = 256
-    activations: Any = nn.gelu
-    layer_norm: bool = True
-
-    @nn.compact
-    def __call__(self, obs, goal):
-        # 1. 显式几何特征 (Explicit Physics)
-        # 在原始空间计算差分，这对低层控制非常重要
-        raw_diff = goal - obs
-
-        # 2. 孪生投影 (Siamese Projection)
-        # 定义一个共享的 Encoder
-        encoder = nn.Dense(
-            self.hidden_dim, kernel_init=default_init(), name="shared_encoder"
-        )
-
-        # 分别编码
-        h_s = encoder(obs)
-        h_g = encoder(goal)
-
-        # 3. 特征交互 (Feature Interaction)
-        # 在潜在空间计算特征差
-        h_diff = h_g - h_s
-        # 也可以加上点积来捕捉相似度
-        h_prod = h_s * h_g
-
-        # 4. 融合 (Fusion)
-        # 我们希望网络同时知道："我在哪" (h_s) 和 "我要去哪" (raw_diff, h_diff)
-        # 注意：通常不需要把 h_g 再次拼进去，因为 h_s + h_diff = h_g，信息是冗余的
-        # 但为了保留绝对目标信息，拼上也无妨
-
-        features = jnp.concatenate(
-            [
-                h_s,  # 当前状态的潜在特征
-                h_diff,  # 潜在空间的相对距离
-                h_prod,  # 潜在空间的匹配度
-                raw_diff,  # 物理空间的真实距离 (Shortcut)
-            ],
-            axis=-1,
-        )
-
-        # 投影回标准维度
-        out = nn.Dense(self.hidden_dim, kernel_init=default_init())(features)
-        out = self.activations(out)
-
-        if self.layer_norm:
-            out = nn.LayerNorm()(out)
-
-        return out
-
-
-class GeometricValueNetwork(nn.Module):
-    """
-    核心 V 网络逻辑：
-    (s, g) -> SymetricEncoder -> MLP Head -> V
-    """
-
-    hidden_dims: Sequence[int]
-    layer_norm: bool = True
-    activations: Any = nn.gelu
-
-    @nn.compact
-    def __call__(self, observations, goals, actions=None):
-        # 注意：V 网络忽略 actions，即使不小心传进来也无所谓
-
-        # 1. 几何特征提取
-        # 使用 hidden_dims[0] 作为 embedding 维度
-        embedding = SymetricStateEncoder(
-            hidden_dim=self.hidden_dims[0],
-            layer_norm=self.layer_norm,
-            activations=self.activations,
-        )(observations, goals)
-
-        x = embedding
-
-        # 2. MLP Head
-        # 从第二个 hidden_dim 开始构建后续层
-        # 如果 hidden_dims 只有一个元素，这就变成直接输出
-        v = MLP(
-            (*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm
-        )(x)
-
-        # 3. 输出 V 值
-        return v.squeeze(-1)
-
-
-class GCGeometricValue(nn.Module):
-    """
-    对外接口类：几何感知的 V 函数。
-    替代 GCValue。
-    """
-
-    hidden_dims: Sequence[int] = (256, 256)
-    layer_norm: bool = True
-    ensemble: bool = False  # V 通常不 ensemble，但保持接口灵活
-    gc_encoder: nn.Module = None  # 兼容性保留
-
-    def setup(self):
-        config = {
-            "hidden_dims": self.hidden_dims,
-            "layer_norm": self.layer_norm,
-        }
-
-        if self.ensemble:
-            GVnetwork = ensemblize(GeometricValueNetwork, 2, **config)
-            self.net = GVnetwork(**config)
-        else:
-            self.net = GeometricValueNetwork(**config)
-
-    def __call__(self, observations, goals, actions=None):
-        return self.net(observations, goals)
-
-
 class FiLM1DBlock(nn.Module):
     """
     基础组件：受Context调制的1D卷积块
@@ -680,11 +561,17 @@ class ChunkCriticNetwork(nn.Module):
     @nn.compact
     def __call__(self, observations, goals, actions):
         # 1. 构建 Context (Obs + Goal)
-        context = SymetricStateEncoder(
-            hidden_dim=self.hidden_dims[0],
-            layer_norm=self.layer_norm,
-            activations=self.activations,
-        )(observations, goals)
+        if goals is not None:
+            context_input = jnp.concatenate([observations, goals], axis=-1)
+        else:
+            context_input = observations
+
+        # 将 Context 嵌入到一个适合调制的大小 (取 conv_dims[-1] 或 hidden_dims[0] 均可，这里用 256)
+        # 这层必须存在，用于特征对齐
+        context = nn.Dense(256, kernel_init=default_init())(context_input)
+        context = self.activations(context)
+        if self.layer_norm:
+            context = nn.LayerNorm()(context)
 
         # 2. 处理动作块 (Action Chunk Stream)
         # 确保 actions 是 3D 的 [Batch, Horizon, Act_Dim]

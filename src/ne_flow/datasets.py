@@ -567,7 +567,9 @@ class GCChunkDataset(GCDataset):
         )
         data["value_goals"] = self.get_observations(value_goal_idxs)
 
-        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        final_state_idxs = self.terminal_locs[
+            np.searchsorted(self.terminal_locs, idxs)
+        ]  # TODO: 合并函数减少一次计算
 
         # 1. 判定是否是未来时刻
         is_future = value_goal_idxs >= idxs
@@ -748,7 +750,9 @@ class HGCChunkDataset(HGCDataset):
             self.config["value_geom_sample"],
         )
         data["value_goals"] = self.get_observations(value_goal_idxs)
-        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        final_state_idxs = self.terminal_locs[
+            np.searchsorted(self.terminal_locs, idxs)
+        ]  # TODO: 合并函数减少一次计算
 
         # --- [BUG FIX] 严谨的命中判定 ---
         # 必须同时满足：1.未来时刻 2.在Horizon内 3.在同一条轨迹内
