@@ -365,7 +365,7 @@ class NE_Agent(flax.struct.PyTreeNode):
         # ===== 2. High-Level Policy (Subgoal) =====
         # 逻辑：Subgoal 不需要每一步都变，通常每 H 步更新一次，或者每一步都更新也可以(更费时)
         # 这里假设保持原来的频率：每 H 步更新一次 Subgoal
-        horizon = self.config["horizon_length"]
+        horizon = self.config["subgoal_horizon"]
         update_subgoal = (state["high_step_counter"] % horizon) == 0
 
         rng, high_rng, low_rng = jax.random.split(seed, 3)
@@ -733,6 +733,7 @@ def get_config():
             action_chunking=True,
             horizon_length=8,
             temporal_decay=0.1,
+            subgoal_horizon=8,
             # Inference Params
             high_num_samples=32,
             low_num_samples=32,
