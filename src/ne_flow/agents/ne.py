@@ -363,10 +363,9 @@ class NE_Agent(flax.struct.PyTreeNode):
         state["prev_goal"] = goal
 
         # ===== 2. High-Level Policy (Subgoal) =====
-        # 逻辑：Subgoal 不需要每一步都变，通常每 H 步更新一次，或者每一步都更新也可以(更费时)
-        # 这里假设保持原来的频率：每 H 步更新一次 Subgoal
-        horizon = self.config["subgoal_horizon"]
-        update_subgoal = (state["high_step_counter"] % horizon) == 0
+        traj_horizon = self.config["horizon_length"]
+        subgoal_horizon = self.config["subgoal_horizon"]
+        update_subgoal = (state["high_step_counter"] % subgoal_horizon) == 0
 
         rng, high_rng, low_rng = jax.random.split(seed, 3)
 
@@ -388,7 +387,7 @@ class NE_Agent(flax.struct.PyTreeNode):
 
         # Reshape: [1, H, A] -> [H, A] (去掉 Batch 维)
         action_dim = self.config["action_dim"]
-        new_chunk = jnp.reshape(action_chunk_flat, (horizon, action_dim))
+        new_chunk = jnp.reshape(action_chunk_flat, (traj_horizon, action_dim))
 
         # ===== 4. 计算时间集成 (JIT call) =====
         # 调用纯函数进行 Buffer 更新和平均
