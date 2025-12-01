@@ -14,7 +14,7 @@ from ne_flow.models import (
 )
 
 
-class NE_Agent(flax.struct.PyTreeNode):
+class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
     """
     Hierarchical Implicit Q-Learning with Flow Matching & Action Chunking.
 
@@ -378,121 +378,49 @@ class NE_Agent(flax.struct.PyTreeNode):
         state["high_step_counter"] += 1
 
         # ===== 3. Low-Level Policy (Action Chunk) =====
-        # 逻辑：为了时间集成，我们需要每一步都预测一个新的 Chunk
+        low_interval = self.config["low_actor_update_interval"]
+        update_low = (state["low_step_counter"] % low_interval) == 0
 
-        # 预测新的 Chunk [1, H*A]
-        action_chunk_flat = self.sample_low_actions(
-            observations=obs, subgoals=state["current_subgoal"], rng=low_rng
-        )
+        if update_low:
+            # 预测新的 Chunk [1, H*A]
+            action_chunk_flat = self.sample_low_actions(
+                observations=obs, subgoals=state["current_subgoal"], rng=low_rng
+            )
+            # Reshape: [1, H, A] -> [H, A] (去掉 Batch 维)
+            action_dim = self.config["action_dim"]
+            new_chunk = jnp.reshape(action_chunk_flat, (traj_horizon, action_dim))
+            state["low_action_chunk"] = new_chunk
+            # Reset internal step within the chunk logic implicitly by using modulo below
 
-        # Reshape: [1, H, A] -> [H, A] (去掉 Batch 维)
-        action_dim = self.config["action_dim"]
-        new_chunk = jnp.reshape(action_chunk_flat, (traj_horizon, action_dim))
+        # ===== 4. 执行动作 =====
+        # 计算当前应该取 chunk 中的第几个动作
+        # 如果 update_interval=1, 则每次取 [0]
+        # 如果 update_interval=K, 则取 [step % K]
+        # 注意：我们需要确保 step % K 不超过 horizon
+        chunk_idx = state["low_step_counter"] % low_interval
 
-        # ===== 4. 计算时间集成 (JIT call) =====
-        # 调用纯函数进行 Buffer 更新和平均
-        # 注意：这里需要传入 decay_rate，可以放在 config 里
-        decay_rate = self.config.get("temporal_decay", 0.1)
+        # 安全检查 (防止配置错误导致索引越界)
+        chunk_idx = jnp.minimum(chunk_idx, traj_horizon - 1)
 
-        new_buffer, new_ptr, current_action = self.compute_ensemble_action(
-            state["ensemble_buffer"],
-            state["ensemble_ptr"],
-            new_chunk,
-            state["episode_step"],
-            decay_rate,
-        )
+        current_action = state["low_action_chunk"][chunk_idx]
 
         # ===== 5. 更新状态 =====
-        state["ensemble_buffer"] = new_buffer
-        state["ensemble_ptr"] = new_ptr
-        state["episode_step"] += 1
+        state["low_step_counter"] += 1
 
         # 返回当前动作 [A]
         return current_action
 
     def reset_inference_state(self, obs_dim, action_dim, horizon):
-        """重置推理状态，初始化集成 Buffer"""
+        """重置推理状态"""
         return {
             # 高层策略状态
             "current_subgoal": jnp.zeros((1, obs_dim)),
             "prev_goal": None,
             "high_step_counter": 0,  # 用于控制高层策略更新频率
-            # 低层策略状态 (时间集成)
-            # Buffer 形状: [H, H, A]
-            "ensemble_buffer": jnp.zeros((horizon, horizon, action_dim)),
-            "ensemble_ptr": 0,
-            "episode_step": 0,  # 用于集成算法中的 mask 计算
+            # 低层策略状态
+            "low_action_chunk": jnp.zeros((horizon, action_dim)),
+            "low_step_counter": 0,
         }
-
-    @staticmethod
-    @jax.jit
-    def compute_ensemble_action(
-        buffer: jnp.ndarray,
-        write_ptr: int,
-        new_chunk: jnp.ndarray,
-        step_idx: int,
-        decay_rate: float,
-    ):
-        """
-        执行单步时间集成 (Temporal Ensemble / Action Aggregation).
-
-        Args:
-            buffer: [Horizon, Horizon, Action_Dim] 环形缓冲区
-            write_ptr: int 当前写入位置
-            new_chunk: [Horizon, Action_Dim] 模型预测出的新动作序列
-            step_idx: int 当前episode的步数 (用于处理原本buffer为空的warmup阶段)
-            decay_rate: float 指数衰减率
-
-        Returns:
-            new_buffer: 更新后的缓冲区
-            new_write_ptr: 更新后的指针
-            action: [Action_Dim] 当前时间步的合成动作
-        """
-        horizon = buffer.shape[0]
-
-        # 1. 将新的预测块写入环形缓冲区
-        # new_chunk[0] 是对 t 的预测, new_chunk[1] 是对 t+1 的预测...
-        new_buffer = buffer.at[write_ptr].set(new_chunk)
-
-        # 2. 收集当前时间步的所有候选动作
-        # 我们需要从过去 Horizon 个预测中提取对当前时刻的预测。
-        # 假设当前是 t。
-        # 刚刚写入的块 (age=0): 位于 write_ptr，它的第 [0] 个元素是对 t 的预测。
-        # 上一步写入的块 (age=1): 位于 write_ptr-1，它的第 [1] 个元素是对 t 的预测。
-        # ...
-        # i 步前写入的块 (age=i): 位于 write_ptr-i，它的第 [i] 个元素是对 t 的预测。
-
-        ages = jnp.arange(horizon)  # [0, 1, ..., H-1]
-
-        # 计算在环形 Buffer 中的读取索引
-        read_indices = (write_ptr - ages + horizon) % horizon
-        # 在 Chunk 中的动作索引就是 age (因为我们预测的是 future chunk)
-        action_indices = ages
-
-        # 提取候选动作: [Horizon, Action_Dim]
-        candidates = new_buffer[read_indices, action_indices]
-
-        # 3. 计算权重 (处理 Warmup 和 衰减)
-        # 只有 age <= step_idx 的预测才是有效的（避免读取到了 Buffer 初始化时的 0）
-        valid_mask = ages <= step_idx
-
-        # 计算指数权重: exp(-k * t)，通常越新鲜的预测(age小，也就是chunk的前端)权重越大
-        # 注意：这与你的测试代码逻辑略有不同，你的测试代码似乎给了旧预测更高的权重。
-        # 现在的逻辑是：动作块的第0步(最准)权重最高，第H步(最远)权重最低。
-        weights = jnp.exp(-decay_rate * ages)
-        weights = weights * valid_mask  # 遮罩无效的历史
-
-        # 归一化
-        total_weight = jnp.sum(weights) + 1e-6  # 避免除零
-        weights = weights / total_weight
-
-        # 4. 加权求和
-        final_action = jnp.sum(candidates * weights[:, None], axis=0)
-
-        # 5. 更新指针
-        new_write_ptr = (write_ptr + 1) % horizon
-
-        return new_buffer, new_write_ptr, final_action
 
     # --- 5. Cascaded Best-of-N Sampling (JIT-compiled) ---
     def sample_flow_actions(self, module_name, obs, goal, out_dim, num_samples, rng):
@@ -682,9 +610,8 @@ class NE_Agent(flax.struct.PyTreeNode):
             "current_subgoal": jnp.zeros((batch_size, obs_dim)),
             "prev_goal": None,
             "high_step_counter": 0,
-            "ensemble_buffer": jnp.zeros((batch_size, horizon, action_dim)),
-            "ensemble_ptr": 0,
-            "episode_step": 0,
+            "low_action_chunk": jnp.zeros((horizon, action_dim)),
+            "low_step_counter": 0,
         }
 
         return cls(
@@ -698,7 +625,7 @@ class NE_Agent(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name="neflow",
+            agent_name="neflow_notemporal",
             lr=3e-4,
             batch_size=1024,
             actor_hidden_dims=(512, 512, 512),
@@ -730,9 +657,10 @@ def get_config():
             low_awr_temp=3.0,
             # Chunking Params
             action_chunking=True,
-            horizon_length=8,
+            horizon_length=4,
             temporal_decay=0.1,
-            subgoal_horizon=8,
+            subgoal_horizon=4,
+            low_actor_update_interval=4,
             # Inference Params
             high_num_samples=32,
             low_num_samples=32,
