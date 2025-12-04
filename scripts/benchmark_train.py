@@ -240,14 +240,21 @@ def run_launcher(_):
 
     all_results = {}  # {seed: {ckpt: score}}
 
-    for seed in seeds:
+    # Calculate steps per seed to compute global step offset
+    # This must match the worker's max_steps calculation to ensure correct step range
+    steps_per_seed = max(FLAGS.train_steps, max(CHECKPOINTS))
+
+    for seed_idx, seed in enumerate(seeds):
         print(f"\n{'=' * 40}")
-        print(f"LAUNCHING WORKER FOR SEED {seed}")
+        print(f"LAUNCHING WORKER FOR SEED {seed} (seed_idx={seed_idx})")
         print(f"{'=' * 40}")
 
         all_results[seed] = {}
 
-        # Construct command
+        # Calculate global step offset for this seed to ensure monotonic progression in wandb
+        global_step_offset = seed_idx * steps_per_seed
+
+        # Construct command with all relevant flags to ensure worker uses same config
         cmd = [sys.executable, sys.argv[0]]
         cmd.extend(
             [
@@ -255,22 +262,36 @@ def run_launcher(_):
                 f"--seed={seed}",
                 f"--env_name={FLAGS.env_name}",
                 f"--run_group={FLAGS.run_group}",
-                f"--save_dir={FLAGS.save_dir}",  # Pass base save dir
+                f"--save_dir={FLAGS.save_dir}",
                 f"--agent={config_flags.get_config_filename(FLAGS['agent'])}",
+                f"--train_steps={FLAGS.train_steps}",
+                f"--log_interval={FLAGS.log_interval}",
+                f"--save_interval={FLAGS.save_interval}",
                 f"--eval_episodes={FLAGS.eval_episodes}",
+                f"--eval_temperature={FLAGS.eval_temperature}",
+                f"--eval_on_cpu={FLAGS.eval_on_cpu}",
             ]
         )
 
-        # Run subprocess and stream output
+        # Add optional flags only if they are provided
+        if FLAGS.restore_path is not None:
+            cmd.append(f"--restore_path={FLAGS.restore_path}")
+        if FLAGS.restore_epoch is not None:
+            cmd.append(f"--restore_epoch={FLAGS.restore_epoch}")
+        if FLAGS.eval_gaussian is not None:
+            cmd.append(f"--eval_gaussian={FLAGS.eval_gaussian}")
+
         # Run subprocess and stream output
         # We DO NOT merge stderr here. stderr (tqdm, errors) goes directly to console.
         # stdout is reserved for our __METRIC__ messages and explicit prints.
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1) as proc:
+        with subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, text=True, bufsize=1
+        ) as proc:
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
                     continue
-                
+
                 # Check for metric (robust search)
                 if METRIC_PREFIX in line:
                     try:
@@ -280,22 +301,32 @@ def run_launcher(_):
                         parts = content.split(METRIC_SEPARATOR)
                         json_part = parts[0].strip()
                         step_part = parts[1].strip()
-                        
+
                         metrics = json.loads(json_part)
                         step = int(step_part.split("=")[1])
-                        
+
+                        # Convert to global step to maintain monotonic progression in wandb
+                        global_step = global_step_offset + step
+
                         # Prefix keys with seed
-                        prefixed_metrics = {f"seed_{seed}/{k}": v for k, v in metrics.items()}
-                        
+                        prefixed_metrics = {
+                            f"seed_{seed}/{k}": v for k, v in metrics.items()
+                        }
+
                         # Store benchmark results if applicable
-                        if "evaluation/overall_success" in metrics and step in CHECKPOINTS:
+                        if (
+                            "evaluation/overall_success" in metrics
+                            and step in CHECKPOINTS
+                        ):
                             score = metrics["evaluation/overall_success"]
                             all_results[seed][step] = score
-                            print(f"-> Captured Benchmark Result: Seed {seed} @ {step} = {score:.4f}")
-                        
-                        # Log to WandB
-                        wandb.log(prefixed_metrics, step=step)
-                        
+                            print(
+                                f"-> Captured Benchmark Result: Seed {seed} @ {step} = {score:.4f} (global_step: {global_step})"
+                            )
+
+                        # Log to WandB with global step
+                        wandb.log(prefixed_metrics, step=global_step)
+
                     except Exception as e:
                         print(f"Error parsing metric line: {line} -> {e}")
                 else:
@@ -307,7 +338,7 @@ def run_launcher(_):
                     f"Worker for seed {seed} finished with error code {proc.returncode}"
                 )
 
-    # 2. Aggregation & Final Reporting
+    # Aggregation & Final Reporting
     print("\n" + "=" * 50)
     print("GENERATING FINAL BENCHMARK REPORT")
     print("=" * 50)
@@ -336,14 +367,17 @@ def run_launcher(_):
 
     # Create WandB Table
     summary_table = wandb.Table(data=table_data, columns=columns)
-    wandb.log({"benchmark_results_table": summary_table})
 
-    # Log Scalar Metrics
+    # Use the next global step after all training steps for final summary
+    final_global_step = len(seeds) * steps_per_seed
+
     wandb.log(
         {
+            "benchmark_results_table": summary_table,
             "benchmark/final_mean_success": final_mean,
             "benchmark/final_std_success": final_std,
-        }
+        },
+        step=final_global_step,
     )
 
     print(f"Final Mean Success: {final_mean:.4f}")
