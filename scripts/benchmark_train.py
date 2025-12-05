@@ -371,6 +371,12 @@ def run_launcher(_):
     # Use the next global step after all training steps for final summary
     final_global_step = len(seeds) * steps_per_seed
 
+    print(f"Final Mean Success: {final_mean:.4f}")
+    print(f"Final Std Success:  {final_std:.4f}")
+    print("-" * 30)
+    for row in table_data:
+        print(f"Seed {row[0]}: {row[1:]}")
+
     wandb.log(
         {
             "benchmark_results_table": summary_table,
@@ -379,12 +385,6 @@ def run_launcher(_):
         },
         step=final_global_step,
     )
-
-    print(f"Final Mean Success: {final_mean:.4f}")
-    print(f"Final Std Success:  {final_std:.4f}")
-    print("-" * 30)
-    for row in table_data:
-        print(f"Seed {row[0]}: {row[1:]}")
 
     wandb.finish()
 
