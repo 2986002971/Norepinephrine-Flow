@@ -154,15 +154,17 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
         Advantage: A = V(w_data, g) - V(s, g)
         """
         # 1. Calculate Advantage
-        # V(s, g) - Baseline
-        v_curr = self.network.select("value")(
-            batch["observations"], batch["high_actor_goals"]
+        # V(s, g) - Baseline AND V(w_data, g) - Quality of the data sample
+        # Concatenate to run in one forward pass for efficiency
+        obs_concat = jnp.concatenate(
+            [batch["observations"], batch["high_actor_targets"]], axis=0
         )
-        # V(w_data, g) - Quality of the data sample
-        # batch['high_actor_targets'] contains the actual subgoals from dataset
-        v_next = self.network.select("value")(
-            batch["high_actor_targets"], batch["high_actor_goals"]
+        goals_concat = jnp.concatenate(
+            [batch["high_actor_goals"], batch["high_actor_goals"]], axis=0
         )
+        
+        v_all = self.network.select("value")(obs_concat, goals_concat)
+        v_curr, v_next = jnp.split(v_all, 2, axis=0)
 
         adv = v_next - v_curr
 
