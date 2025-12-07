@@ -281,6 +281,12 @@ def run_launcher(_):
         if FLAGS.eval_gaussian is not None:
             cmd.append(f"--eval_gaussian={FLAGS.eval_gaussian}")
 
+        # Pass through agent config overrides (e.g. --agent.learning_rate=...)
+        # We assume standard --key=value format for overrides.
+        for arg in sys.argv:
+            if arg.startswith("--agent."):
+                cmd.append(arg)
+
         # Run subprocess and stream output
         # We DO NOT merge stderr here. stderr (tqdm, errors) goes directly to console.
         # stdout is reserved for our __METRIC__ messages and explicit prints.
