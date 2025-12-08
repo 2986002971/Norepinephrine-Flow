@@ -162,7 +162,7 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
         goals_concat = jnp.concatenate(
             [batch["high_actor_goals"], batch["high_actor_goals"]], axis=0
         )
-        
+
         v_all = self.network.select("value")(obs_concat, goals_concat)
         v_curr, v_next = jnp.split(v_all, 2, axis=0)
 
@@ -639,8 +639,8 @@ def get_config():
             expectile=0.9,
             # Hierarchical Params
             subgoal_steps=25,
-            low_top_k=1,
-            high_top_k=2,
+            low_top_k=4,
+            high_top_k=4,
             discrete=False,  # unused
             # Dataset Params
             dataset_class="HGCChunkDataset",
@@ -660,7 +660,6 @@ def get_config():
             # Chunking Params
             action_chunking=True,
             horizon_length=4,
-            temporal_decay=0.1,
             subgoal_horizon=4,
             low_actor_update_interval=4,
             # Inference Params
