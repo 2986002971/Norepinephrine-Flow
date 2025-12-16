@@ -14,7 +14,7 @@ from ne_flow.models import (
 )
 
 
-class NE_Agent(flax.struct.PyTreeNode):
+class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
     """
     Hierarchical Implicit Q-Learning with Flow Matching & Action Chunking.
 
@@ -698,7 +698,7 @@ class NE_Agent(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name="neflow",
+            agent_name="neflow_withtemporal",
             lr=3e-4,
             batch_size=1024,
             actor_hidden_dims=(512, 512, 512),

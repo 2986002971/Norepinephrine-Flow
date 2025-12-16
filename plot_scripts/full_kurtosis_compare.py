@@ -5,6 +5,7 @@ from typing import Dict, List
 import flax
 import jax
 import jax.numpy as jnp
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 from absl import app, flags
@@ -20,7 +21,6 @@ from ne_flow.datasets import (
 )
 from ne_flow.env_utils import make_env_and_datasets
 from ne_flow.evaluation import supply_rng
-
 
 FLAGS = flags.FLAGS
 
@@ -46,7 +46,7 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     "output_overall_plot",
     "exp/overall_kurtosis_compare.png",
-    "Path to save overall kurtosis comparison chart.",
+    "Path to save overall kurtosis comparison chart (Violin Plot).",
 )
 flags.DEFINE_string(
     "output_step_csv",
@@ -125,40 +125,105 @@ def compute_kurtosis_from_array(data: np.ndarray) -> float:
     return float(np.mean(kurt))
 
 
+def set_arial_font():
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = ["Arial"]
+
+
+def get_custom_colormap():
+    """
+    Creates a custom LinearSegmentedColormap based on the user's specification:
+    Yellow (Low Gain) -> Light Green -> Blue (High Gain)
+    """
+    colors = [
+        (228 / 255, 184 / 255, 127 / 255),  # Yellow
+        (70 / 255, 170 / 255, 180 / 255),  # Cyan-Blue
+        (48 / 255, 104 / 255, 141 / 255),  # Blue
+    ]
+    return mcolors.LinearSegmentedColormap.from_list("custom_gain", colors, N=100)
+
+
 def plot_step_kurtosis(step_records: Dict[float, List[float]], output_path: str):
+    set_arial_font()
+    cmap = get_custom_colormap()
+
     plt.figure(figsize=(7, 4))
-    for temp in sorted(step_records.keys()):
+
+    temps = sorted(step_records.keys())
+    num_temps = len(temps)
+
+    for i, temp in enumerate(temps):
         values = step_records[temp]
         if not values:
             continue
-        plt.plot(range(1, len(values) + 1), values, label=f"temp={temp}")
+
+        # Calculate color based on position in the sorted list
+        if num_temps > 1:
+            color = cmap(i / (num_temps - 1))
+        else:
+            color = cmap(0.5)
+
+        plt.plot(
+            range(1, len(values) + 1),
+            values,
+            label=f"temp={temp}",
+            color=color,
+            linewidth=2,
+        )
+
     plt.xlabel("Decision step")
     plt.ylabel("Kurtosis")
     plt.title("Per-step Action Distribution Kurtosis")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(output_path, bbox_inches="tight")
+    plt.savefig(output_path, bbox_inches="tight", dpi=300)
     plt.close()
 
 
-def plot_overall_kurtosis(kurtosis_map: Dict[float, float], output_path: str):
-    temps = sorted(kurtosis_map.keys())
-    values = [kurtosis_map[t] for t in temps]
-    plt.figure(figsize=(8, 5))
-    plt.plot(
-        temps, values, marker="o", linestyle="-", color="#4c78a8", label="Avg. Kurtosis"
-    )
-    plt.axhline(
-        y=3, color="r", linestyle="--", label="Normal Dist. Kurtosis (3.0)"
-    )
-    plt.xlabel("low_awr_temp")
-    plt.ylabel("Average Kurtosis")
-    plt.title("Overall Action Distribution Kurtosis vs. Temperature")
-    plt.ylim(bottom=3)
-    plt.legend()
-    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+def plot_kurtosis_violin(step_records: Dict[float, List[float]], output_path: str):
+    set_arial_font()
+    cmap = get_custom_colormap()
+
+    temps = sorted(step_records.keys())
+    data = [step_records[t] for t in temps]
+    num_temps = len(temps)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Violin plot
+    parts = ax.violinplot(data, showmeans=True, showmedians=False, showextrema=True)
+
+    # Customize aesthetics
+    for i, pc in enumerate(parts["bodies"]):
+        if num_temps > 1:
+            color = cmap(i / (num_temps - 1))
+        else:
+            color = cmap(0.5)
+
+        pc.set_facecolor(color)
+        pc.set_edgecolor("black")
+        pc.set_alpha(0.9)  # High opacity to show the color clearly
+
+    for partname in ("cbars", "cmins", "cmaxes", "cmeans"):
+        if partname in parts:
+            vp = parts[partname]
+            vp.set_edgecolor("#333333")  # Dark grey lines
+            vp.set_linewidth(1.0)
+
+    ax.set_title("Kurtosis Distribution by Temperature", fontsize=14)
+    ax.set_ylabel("Kurtosis", fontsize=12)
+    ax.set_xlabel("Temperature / Gain", fontsize=12)
+
+    ax.set_xticks(np.arange(1, len(temps) + 1))
+    ax.set_xticklabels([str(t) for t in temps])
+
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+
+    ax.axhline(y=3.0, color="r", linestyle="--", alpha=0.5, label="Normal Dist. (3.0)")
+    ax.legend()
+
     plt.tight_layout()
-    plt.savefig(output_path, bbox_inches="tight")
+    plt.savefig(output_path, bbox_inches="tight", dpi=300)
     plt.close()
 
 
@@ -195,9 +260,7 @@ def rollout_stepwise(env, best_agent, agents_map, num_episodes, max_steps, seed)
     for idx, temp in enumerate(agents_map.keys()):
         agent_rngs[temp] = jax.random.PRNGKey(seed + 3000 + idx)
 
-    for episode_idx in trange(
-        num_episodes, desc="Rollout Episodes", unit="episode"
-    ):
+    for episode_idx in trange(num_episodes, desc="Rollout Episodes", unit="episode"):
         try:
             observation, info = env.reset(options=dict(task_id=None, render_goal=False))
         except TypeError:
@@ -296,7 +359,7 @@ def main(_):
             overall_kurt[temp] = np.mean(kurt_values)
 
     plot_step_kurtosis(per_step_kurt, FLAGS.output_step_plot)
-    plot_overall_kurtosis(overall_kurt, FLAGS.output_overall_plot)
+    plot_kurtosis_violin(per_step_kurt, FLAGS.output_overall_plot)
     save_step_csv(per_step_kurt, FLAGS.output_step_csv)
     save_overall_csv(overall_kurt, FLAGS.output_overall_csv)
 
@@ -309,4 +372,3 @@ def main(_):
 
 if __name__ == "__main__":
     app.run(main)
-
