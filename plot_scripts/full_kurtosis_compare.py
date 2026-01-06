@@ -126,8 +126,7 @@ def compute_kurtosis_from_array(data: np.ndarray) -> float:
 
 
 def set_arial_font():
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = ["Arial"]
+    plt.rcParams["font.family"] = "Arial"
 
 
 def get_custom_colormap():
