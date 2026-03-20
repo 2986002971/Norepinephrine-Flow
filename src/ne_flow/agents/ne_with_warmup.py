@@ -14,7 +14,7 @@ from ne_flow.models import (
 )
 
 
-class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
+class NE_with_warmup(flax.struct.PyTreeNode):
     """
     Hierarchical Implicit Q-Learning with Flow Matching & Action Chunking.
 
@@ -148,8 +148,16 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
             "q_mean": 0.5 * (q1 + q2).mean(),
         }
 
+    @staticmethod
+    def _linear_warmup(step, target_value, warmup_steps):
+        """Linear warmup schedule from 0 to target_value."""
+        if warmup_steps <= 0:
+            return target_value
+        progress = jnp.clip(step / float(warmup_steps), 0.0, 1.0)
+        return target_value * progress
+
     # --- 2. Hierarchical Policy Learning (Weighted Flow Matching) ---
-    def high_actor_loss(self, batch, grad_params, rng):
+    def high_actor_loss(self, batch, grad_params, step, rng):
         """
         High-Level Policy: Predicts Subgoal w.
         Advantage: A = V(w_data, g) - V(s, g)
@@ -170,7 +178,10 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
         adv = v_next - v_curr
 
         # 2. Calculate AWR Weights
-        weights = jnp.exp(adv * self.config["high_beta"])
+        current_beta = self._linear_warmup(
+            step, self.config["high_beta"], self.config["beta_warmup_steps"]
+        )
+        weights = jnp.exp(adv * current_beta)
         weights = jnp.clip(weights, max=100.0)
         weights = jax.lax.stop_gradient(weights)
 
@@ -186,15 +197,21 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
         )
 
         loss_per_sample = jnp.mean(sq_diff, axis=-1)  # Reduce -> [B]
-        loss = jnp.mean(weights * loss_per_sample)
+
+        actor_loss_mult = self._linear_warmup(
+            step, 1.0, self.config["actor_loss_warmup_steps"]
+        )
+        loss = jnp.mean(weights * loss_per_sample) * actor_loss_mult
 
         return loss, {
             "high_actor_loss": loss,
             "high_adv_mean": adv.mean(),
             "high_weights": weights.mean(),
+            "high_beta_curr": current_beta,
+            "high_loss_mult": actor_loss_mult,
         }
 
-    def low_actor_loss(self, batch, grad_params, rng):
+    def low_actor_loss(self, batch, grad_params, step, rng):
         """
         Low-Level Policy: Predicts Action Chunk a_t:t+h.
         Advantage: A = Q(s, a_chunk, w) - V(s, w)
@@ -218,7 +235,10 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
         adv = q - v
 
         # 2. Calculate AWR Weights [B]
-        weights = jnp.exp(adv * self.config["low_beta"])
+        current_beta = self._linear_warmup(
+            step, self.config["low_beta"], self.config["beta_warmup_steps"]
+        )
+        weights = jnp.exp(adv * current_beta)
         weights = jnp.clip(weights, max=100.0)
         weights = jax.lax.stop_gradient(weights)
 
@@ -246,17 +266,23 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
         # 4. Apply Valid Mask and AWR Weights
         # step_weights: [B, H]
         step_weights = batch["valid"] * weights[:, None]
-        loss = jnp.mean(step_weights * loss_per_step)
+
+        actor_loss_mult = self._linear_warmup(
+            step, 1.0, self.config["actor_loss_warmup_steps"]
+        )
+        loss = jnp.mean(step_weights * loss_per_step) * actor_loss_mult
 
         return loss, {
             "low_actor_loss": loss,
             "low_adv_mean": adv.mean(),
             "low_weights": weights.mean(),
+            "low_beta_curr": current_beta,
+            "low_loss_mult": actor_loss_mult,
         }
 
     # --- 3. Training Loop Boilerplate ---
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, step, rng=None):
         rng = rng if rng is not None else self.rng
         rng, high_rng, low_rng = jax.random.split(rng, 3)
 
@@ -273,12 +299,12 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
             info[f"critic/{k}"] = v
 
         # High Actor Update
-        h_loss, h_info = self.high_actor_loss(batch, grad_params, high_rng)
+        h_loss, h_info = self.high_actor_loss(batch, grad_params, step, high_rng)
         for k, v in h_info.items():
             info[f"high_actor/{k}"] = v
 
         # Low Actor Update
-        l_loss, l_info = self.low_actor_loss(batch, grad_params, low_rng)
+        l_loss, l_info = self.low_actor_loss(batch, grad_params, step, low_rng)
         for k, v in l_info.items():
             info[f"low_actor/{k}"] = v
 
@@ -295,11 +321,11 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
         network.params[f"modules_target_{module_name}"] = new_target_params
 
     @jax.jit
-    def update(self, batch):
+    def update(self, batch, step):
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, step, rng=rng)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, "critic")
@@ -628,7 +654,7 @@ class NE_without_temporal_ensemble(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name="neflow_notemporal",
+            agent_name="ne_with_warmup",
             lr=3e-4,
             batch_size=1024,
             actor_hidden_dims=(512, 512, 512),
@@ -659,6 +685,9 @@ def get_config():
             flow_steps=10,
             high_beta=3.0,
             low_beta=3.0,
+            # Scheduling Params
+            beta_warmup_steps=0,  # Set to e.g., 200000 for warmup
+            actor_loss_warmup_steps=200000,  # Set to e.g., 200000 for warmup
             # Chunking Params
             action_chunking=True,
             low_chunk_length=4,
