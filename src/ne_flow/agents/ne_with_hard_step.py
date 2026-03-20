@@ -268,6 +268,31 @@ class NE_with_hard_step(flax.struct.PyTreeNode):
         rng = rng if rng is not None else self.rng
         rng, high_rng, low_rng = jax.random.split(rng, 3)
 
+        info = {}
+
+        # Value Update
+        v_loss, v_info = self.value_loss(batch, grad_params)
+        for k, v in v_info.items():
+            info[f"value/{k}"] = v
+
+        # Critic Update
+        c_loss, c_info = self.critic_loss(batch, grad_params)
+        for k, v in c_info.items():
+            info[f"critic/{k}"] = v
+
+        # High Actor Update
+        h_loss, h_info = self.high_actor_loss(batch, grad_params, rng=high_rng)
+        for k, v in h_info.items():
+            info[f"high_actor/{k}"] = v
+
+        # Low Actor Update
+        l_loss, l_info = self.low_actor_loss(batch, grad_params, rng=low_rng)
+        for k, v in l_info.items():
+            info[f"low_actor/{k}"] = v
+
+        total = v_loss + c_loss + h_loss + l_loss
+        return total, info
+
     def target_update(self, network, module_name):
         """Update target network (only needed for Critic in this setup)."""
         new_target_params = jax.tree_util.tree_map(
