@@ -367,14 +367,15 @@ class NE_with_cross_scheduling(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
 
         # Prevent Adam drift by keeping old critic parameters (zero-copy)
-        old_params = flax.core.unfreeze(self.network.params)
-        new_params = flax.core.unfreeze(new_network.params)
+        # Use standard dict to avoid changing the PyTree node type which would crash Optax!
+        old_params = self.network.params
+        new_params = dict(new_network.params)
 
         new_params["modules_value"] = old_params["modules_value"]
         new_params["modules_critic"] = old_params["modules_critic"]
         new_params["modules_target_critic"] = old_params["modules_target_critic"]
 
-        new_network = new_network.replace(params=flax.core.freeze(new_params))
+        new_network = new_network.replace(params=new_params)
 
         return self.replace(network=new_network, rng=new_rng), info
 
