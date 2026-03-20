@@ -4,6 +4,7 @@ from ne_flow.agents.gciql import GCIQLAgent
 from ne_flow.agents.gcivl import GCIVLAgent
 from ne_flow.agents.hiql import HIQLAgent
 from ne_flow.agents.hiql2 import HIQL2Agent
+from ne_flow.agents.ne_with_cross_scheduling import NE_with_cross_scheduling
 from ne_flow.agents.ne_with_temporal_ensemble import NE_with_temporal_ensemble_Agent
 from ne_flow.agents.ne_with_warmup import NE_with_warmup
 from ne_flow.agents.ne_without_high import NE_without_high
@@ -26,4 +27,5 @@ agents = dict(
     neflow_notemporal=NE_without_temporal_ensemble,
     neflow_notopk=NE_without_topk,
     ne_with_warmup=NE_with_warmup,
+    ne_with_cross_scheduling=NE_with_cross_scheduling,
 )
