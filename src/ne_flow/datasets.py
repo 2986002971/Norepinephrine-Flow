@@ -469,7 +469,7 @@ class GCChunkDataset(GCDataset):
         对应时间步 s_t
 
     actions: np.ndarray
-        动作序列，形状 [batch_size, horizon_length, action_dim]
+        动作序列，形状 [batch_size, low_chunk_length, action_dim]
         对应时间步 [a_t, a_{t+1}, ..., a_{t+H-1}]
 
     next_observations: np.ndarray
@@ -485,7 +485,7 @@ class GCChunkDataset(GCDataset):
         用于策略训练的最终目标
 
     rewards: np.ndarray
-        奖励序列，形状 [batch_size, horizon_length]
+        奖励序列，形状 [batch_size, low_chunk_length]
         gc_negative=True:  [-1,...,-1, 0,0,...,0]（达成前惩罚，达成后中性）
         gc_negative=False: [0,...,0, 1,0,...,0]（仅在达成瞬间奖励）
         达成后的所有时间步奖励为0，避免干扰学习
@@ -497,7 +497,7 @@ class GCChunkDataset(GCDataset):
         用于屏蔽已达成目标的样本对价值函数的影响
 
     valid: np.ndarray
-        动作时序有效性掩码，形状 [batch_size, horizon_length]
+        动作时序有效性掩码，形状 [batch_size, low_chunk_length]
         取值范围 [0.0, 1.0]
         在actor_goal达成前（含达成时刻）为1，之后为0
         用于屏蔽无效动作对演员函数的影响
@@ -506,8 +506,8 @@ class GCChunkDataset(GCDataset):
 
     def __post_init__(self):
         super().__post_init__()
-        assert "horizon_length" in self.config, "horizon_length未在配置中指定"
-        self.horizon_length = self.config["horizon_length"]
+        assert "low_chunk_length" in self.config, "low_chunk_length未在配置中指定"
+        self.low_chunk_length = self.config["low_chunk_length"]
 
     def sample(
         self,
@@ -529,15 +529,15 @@ class GCChunkDataset(GCDataset):
         # 起始观测（单帧）
         batch["observations"] = self.get_observations(idxs)
 
-        # 动作序列索引 [batch, horizon_length]
-        seq_indices = idxs[:, None] + np.arange(self.horizon_length)[None, :]
+        # 动作序列索引 [batch, low_chunk_length]
+        seq_indices = idxs[:, None] + np.arange(self.low_chunk_length)[None, :]
         seq_indices_clipped = np.minimum(seq_indices, final_state_idxs[:, None])
 
-        # 安全地获取动作序列 [batch, horizon_length, action_dim]
+        # 安全地获取动作序列 [batch, low_chunk_length, action_dim]
         batch["actions"] = self.dataset["actions"][seq_indices_clipped]
 
-        # horizon_length步后的下一观测（用于价值函数）
-        next_idxs = np.minimum(idxs + self.horizon_length, final_state_idxs)
+        # low_chunk_length步后的下一观测（用于价值函数）
+        next_idxs = np.minimum(idxs + self.low_chunk_length, final_state_idxs)
 
         batch["next_observations"] = self.get_observations(next_idxs)
 
@@ -555,7 +555,7 @@ class GCChunkDataset(GCDataset):
         is_future = value_goal_idxs >= idxs
 
         # 2. 判定是否在 Horizon 范围内
-        horizon_limits = idxs + self.horizon_length
+        horizon_limits = idxs + self.low_chunk_length
         in_horizon = value_goal_idxs < horizon_limits
 
         # 3. 判定是否在同一条轨迹 (目标索引不能超过当前轨迹的终点)
@@ -565,13 +565,13 @@ class GCChunkDataset(GCDataset):
         value_goal_hit = is_future & in_horizon & same_traj
 
         # 计算目标相对于起始索引的步数
-        # 对于未命中的样本，设goal_steps = horizon_length（永不触发奖励转换）
+        # 对于未命中的样本，设goal_steps = low_chunk_length（永不触发奖励转换）
         goal_steps = np.where(
-            value_goal_hit, value_goal_idxs - idxs, self.horizon_length
-        )  # 关键：设为horizon_length，永远大于时间步矩阵
+            value_goal_hit, value_goal_idxs - idxs, self.low_chunk_length
+        )  # 关键：设为low_chunk_length，永远大于时间步矩阵
 
-        # 生成时间步矩阵 (1, horizon_length)
-        time_steps = np.arange(self.horizon_length)[None, :]
+        # 生成时间步矩阵 (1, low_chunk_length)
+        time_steps = np.arange(self.low_chunk_length)[None, :]
 
         # 计算奖励序列
         if self.config.get("gc_negative", True):
@@ -599,7 +599,7 @@ class GCChunkDataset(GCDataset):
         # 计算演员目标达成的相对步数
         actor_goal_steps = actor_goal_idxs - idxs
 
-        time_steps = np.arange(self.horizon_length)[None, :]
+        time_steps = np.arange(self.low_chunk_length)[None, :]
 
         # t <= actor_goal_step时有效，否则无效
         batch["valid"] = np.where(time_steps <= actor_goal_steps[:, None], 1.0, 0.0)
@@ -620,7 +620,7 @@ class HGCChunkDataset(HGCDataset):
         对应时间步 s_t
 
     actions: np.ndarray
-        动作序列，形状 [batch_size, horizon_length, action_dim]
+        动作序列，形状 [batch_size, low_chunk_length, action_dim]
         对应时间步 [a_t, a_{t+1}, ..., a_{t+H-1}]
 
     next_observations: np.ndarray
@@ -644,7 +644,7 @@ class HGCChunkDataset(HGCDataset):
         用于监督高层策略的预测
 
     rewards: np.ndarray
-        奖励序列，形状 [batch_size, horizon_length]
+        奖励序列，形状 [batch_size, low_chunk_length]
         gc_negative=True:  [-1,...,-1, 0,0,...,0]（达成前惩罚，达成后中性）
         gc_negative=False: [0,...,0, 1,0,...,0]（仅在达成瞬间奖励）
         达成后的所有时间步奖励为0，避免干扰学习
@@ -656,7 +656,7 @@ class HGCChunkDataset(HGCDataset):
         用于屏蔽已达成目标的样本对价值函数的影响
 
     valid: np.ndarray
-        动作时序有效性掩码，形状 [batch_size, horizon_length]
+        动作时序有效性掩码，形状 [batch_size, low_chunk_length]
         取值范围 [0.0, 1.0]
         在low_actor_goal达成前（含达成时刻）为1，之后为0
         用于屏蔽无效动作对演员函数的影响
@@ -665,8 +665,8 @@ class HGCChunkDataset(HGCDataset):
 
     def __post_init__(self):
         super().__post_init__()
-        assert "horizon_length" in self.config, "horizon_length未在配置中指定"
-        self.horizon_length = self.config["horizon_length"]
+        assert "low_chunk_length" in self.config, "low_chunk_length未在配置中指定"
+        self.low_chunk_length = self.config["low_chunk_length"]
 
     def sample(
         self,
@@ -687,17 +687,17 @@ class HGCChunkDataset(HGCDataset):
         # 起始观测
         batch["observations"] = self.get_observations(idxs)
 
-        # 动作序列索引 [batch, horizon_length]
+        # 动作序列索引 [batch, low_chunk_length]
         # 钳位到轨迹终点，防止跨轨迹读取动作
-        seq_indices = idxs[:, None] + np.arange(self.horizon_length)[None, :]
+        seq_indices = idxs[:, None] + np.arange(self.low_chunk_length)[None, :]
         seq_indices_clipped = np.minimum(seq_indices, final_state_idxs[:, None])
 
-        # 获取动作序列 [batch, horizon_length, action_dim]
+        # 获取动作序列 [batch, low_chunk_length, action_dim]
         batch["actions"] = self.dataset["actions"][seq_indices_clipped]
 
-        # horizon_length步后的下一观测（用于价值函数）
+        # low_chunk_length步后的下一观测（用于价值函数）
         # 同样钳位到轨迹终点
-        next_idxs = np.minimum(idxs + self.horizon_length, final_state_idxs)
+        next_idxs = np.minimum(idxs + self.low_chunk_length, final_state_idxs)
         batch["next_observations"] = self.get_observations(next_idxs)
 
         # ==========================================
@@ -715,20 +715,20 @@ class HGCChunkDataset(HGCDataset):
         # --- [BUG FIX] 严谨的命中判定 ---
         # 必须同时满足：1.未来时刻 2.在Horizon内 3.在同一条轨迹内
         is_future = value_goal_idxs >= idxs
-        horizon_limits = idxs + self.horizon_length
+        horizon_limits = idxs + self.low_chunk_length
         in_horizon = value_goal_idxs < horizon_limits
         same_traj = value_goal_idxs <= final_state_idxs
 
         value_goal_hit = is_future & in_horizon & same_traj
         # -----------------------------------
 
-        # 计算目标相对步数 (未命中设为 horizon_length)
+        # 计算目标相对步数 (未命中设为 low_chunk_length)
         goal_steps = np.where(
-            value_goal_hit, value_goal_idxs - idxs, self.horizon_length
+            value_goal_hit, value_goal_idxs - idxs, self.low_chunk_length
         )
 
         # 生成奖励序列
-        time_steps = np.arange(self.horizon_length)[None, :]
+        time_steps = np.arange(self.low_chunk_length)[None, :]
         if self.config.get("gc_negative", True):
             # 模式A：达成前 -1，达成后 0
             batch["rewards"] = np.where(time_steps < goal_steps[:, None], -1.0, 0.0)

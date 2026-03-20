@@ -106,7 +106,7 @@ def collect_action_distribution(agent, observation, goal, rng_key):
     rng_key, low_rng = jax.random.split(rng_key)
 
     # Generate candidates
-    horizon = agent.config["horizon_length"] if agent.config["action_chunking"] else 1
+    horizon = agent.config["low_chunk_length"] if agent.config["action_chunking"] else 1
     action_dim = agent.config["action_dim"] * horizon
     candidates = agent.sample_flow_actions(
         "low_actor", obs, subgoal, action_dim, agent.config["low_num_samples"], low_rng

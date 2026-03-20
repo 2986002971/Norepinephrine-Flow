@@ -91,11 +91,11 @@ class NE_without_topk(flax.struct.PyTreeNode):
     def critic_loss(self, batch, grad_params):
         if self.config["action_chunking"]:
             actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
-            discount = self.config["discount"] ** self.config["horizon_length"]
+            discount = self.config["discount"] ** self.config["low_chunk_length"]
             rewards = jnp.sum(
                 batch["rewards"]
                 * (
-                    self.config["discount"] ** jnp.arange(self.config["horizon_length"])
+                    self.config["discount"] ** jnp.arange(self.config["low_chunk_length"])
                 ),
                 axis=1,
             )
@@ -138,7 +138,7 @@ class NE_without_topk(flax.struct.PyTreeNode):
 
         adv = v_next - v_curr
 
-        weights = jnp.exp(adv * self.config["high_awr_temp"])
+        weights = jnp.exp(adv * self.config["high_beta"])
         weights = jnp.clip(weights, max=100.0)
         weights = jax.lax.stop_gradient(weights)
 
@@ -177,7 +177,7 @@ class NE_without_topk(flax.struct.PyTreeNode):
 
         adv = q - v
 
-        weights = jnp.exp(adv * self.config["low_awr_temp"])
+        weights = jnp.exp(adv * self.config["low_beta"])
         weights = jnp.clip(weights, max=100.0)
         weights = jax.lax.stop_gradient(weights)
 
@@ -270,7 +270,7 @@ class NE_without_topk(flax.struct.PyTreeNode):
             new_state = self.reset_inference_state(
                 self.config["obs_dim"],
                 self.config["action_dim"],
-                self.config["horizon_length"],
+                self.config["low_chunk_length"],
             )
             self._state.update(new_state)
 
@@ -285,7 +285,7 @@ class NE_without_topk(flax.struct.PyTreeNode):
                 new_state = self.reset_inference_state(
                     self.config["obs_dim"],
                     self.config["action_dim"],
-                    self.config["horizon_length"],
+                    self.config["low_chunk_length"],
                 )
                 self._state.clear()
                 self._state.update(new_state)
@@ -294,9 +294,9 @@ class NE_without_topk(flax.struct.PyTreeNode):
         state["prev_goal"] = goal
 
         # Hierarchical Logic
-        traj_horizon = self.config["horizon_length"]
-        subgoal_horizon = self.config["subgoal_horizon"]
-        update_subgoal = (state["high_step_counter"] % subgoal_horizon) == 0
+        traj_horizon = self.config["low_chunk_length"]
+        subgoal_replan_interval = self.config["subgoal_replan_interval"]
+        update_subgoal = (state["high_step_counter"] % subgoal_replan_interval) == 0
 
         rng, high_rng, low_rng = jax.random.split(seed, 3)
 
@@ -310,7 +310,7 @@ class NE_without_topk(flax.struct.PyTreeNode):
         state["high_step_counter"] += 1
 
         # Low-Level Logic
-        low_interval = self.config["low_actor_update_interval"]
+        low_interval = self.config["low_chunk_replan_interval"]
         update_low = (state["low_step_counter"] % low_interval) == 0
 
         if update_low:
@@ -390,7 +390,7 @@ class NE_without_topk(flax.struct.PyTreeNode):
 
         # Force N=1
         N = 1
-        action_dim = self.config["action_dim"] * self.config["horizon_length"]
+        action_dim = self.config["action_dim"] * self.config["low_chunk_length"]
 
         candidate_actions = self.sample_flow_actions(
             "low_actor", observations, subgoals, action_dim, N, low_rng
@@ -408,7 +408,7 @@ class NE_without_topk(flax.struct.PyTreeNode):
         obs_dim = ex_observations.shape[-1]
         action_dim = ex_actions.shape[-1]
         full_action_dim = action_dim * (
-            config["horizon_length"] if config["action_chunking"] else 1
+            config["low_chunk_length"] if config["action_chunking"] else 1
         )
 
         # Placeholders
@@ -474,7 +474,7 @@ class NE_without_topk(flax.struct.PyTreeNode):
         config["obs_dim"] = obs_dim
         config["action_dim"] = action_dim
 
-        horizon = config["horizon_length"]
+        horizon = config["low_chunk_length"]
         batch_size = 1
 
         inference_state = {
@@ -508,6 +508,7 @@ def get_config():
             expectile=0.9,
             # Hierarchical Params
             subgoal_steps=25,
+            subgoal_replan_interval=4,
             discrete=False,  # unused
             # Top-K Params REMOVED (Implicitly N=1)
             # Dataset Params
@@ -523,13 +524,12 @@ def get_config():
             gc_negative=True,
             # Flow / AWR Params
             flow_steps=10,
-            high_awr_temp=3.0,
-            low_awr_temp=3.0,
+            high_beta=3.0,
+            low_beta=3.0,
             # Chunking Params
             action_chunking=True,
-            horizon_length=8,
-            subgoal_horizon=4,
-            low_actor_update_interval=4,
+            low_chunk_length=8,
+            low_chunk_replan_interval=4,
             # Inference Params
             high_num_samples=1,  # Force to 1
             low_num_samples=1,  # Force to 1
