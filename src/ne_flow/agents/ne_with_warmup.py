@@ -686,7 +686,7 @@ def get_config():
             high_beta=3.0,
             low_beta=3.0,
             # Scheduling Params
-            beta_warmup_steps=0,  # Set to e.g., 200000 for warmup
+            beta_warmup_steps=200000,  # Set to e.g., 200000 for warmup
             actor_loss_warmup_steps=200000,  # Set to e.g., 200000 for warmup
             # Chunking Params
             action_chunking=True,
