@@ -766,7 +766,7 @@ def get_config():
             high_num_samples=32,
             low_num_samples=32,
             # Misc
-            encoder=None,
+            encoder=ml_collections.config_dict.placeholder(str),
             frame_stack=ml_collections.config_dict.placeholder(int),
         )
     )
