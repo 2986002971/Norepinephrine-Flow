@@ -291,36 +291,48 @@ class NE_with_warmup(flax.struct.PyTreeNode):
 
         if self.config["encoder"] is not None:
             # Encode visual observations (with gradients for V/Q)
-            z_s = self.network.select("encoder")(batch["observations"], train=True, params=grad_params)
-            z_g = self.network.select("encoder")(batch["value_goals"], train=True, params=grad_params)
-            
+            z_s = self.network.select("encoder")(
+                batch["observations"], train=True, params=grad_params
+            )
+            z_g = self.network.select("encoder")(
+                batch["value_goals"], train=True, params=grad_params
+            )
+
             # Target Encoder for High Actor Flow matching
-            z_target = self.network.select("target_encoder")(batch["high_actor_targets"], train=False)
+            z_target = self.network.select("target_encoder")(
+                batch["high_actor_targets"], train=False
+            )
             z_target = jax.lax.stop_gradient(z_target)
-            
+
             # Additional encoded inputs for actors (frozen)
             z_s_sg = jax.lax.stop_gradient(z_s)
-            
-            z_high_actor_goals = self.network.select("encoder")(batch["high_actor_goals"], train=True, params=grad_params)
+
+            z_high_actor_goals = self.network.select("encoder")(
+                batch["high_actor_goals"], train=True, params=grad_params
+            )
             z_high_actor_goals_sg = jax.lax.stop_gradient(z_high_actor_goals)
-            
-            z_low_actor_goals = self.network.select("encoder")(batch["low_actor_goals"], train=True, params=grad_params)
+
+            z_low_actor_goals = self.network.select("encoder")(
+                batch["low_actor_goals"], train=True, params=grad_params
+            )
             z_low_actor_goals_sg = jax.lax.stop_gradient(z_low_actor_goals)
-            
-            z_next_obs = self.network.select("encoder")(batch["next_observations"], train=True, params=grad_params)
+
+            z_next_obs = self.network.select("encoder")(
+                batch["next_observations"], train=True, params=grad_params
+            )
             z_next_obs_sg = jax.lax.stop_gradient(z_next_obs)
-            
+
             # Construct latent batches
             v_c_batch = batch.copy()
             v_c_batch["observations"] = z_s
             v_c_batch["value_goals"] = z_g
             v_c_batch["next_observations"] = z_next_obs_sg
-            
+
             h_actor_batch = batch.copy()
             h_actor_batch["observations"] = z_s_sg
             h_actor_batch["high_actor_goals"] = z_high_actor_goals_sg
             h_actor_batch["high_actor_targets"] = z_target
-            
+
             l_actor_batch = batch.copy()
             l_actor_batch["observations"] = z_s_sg
             l_actor_batch["low_actor_goals"] = z_low_actor_goals_sg
@@ -340,7 +352,9 @@ class NE_with_warmup(flax.struct.PyTreeNode):
             info[f"critic/{k}"] = v
 
         # High Actor Update
-        h_loss, h_info = self.high_actor_loss(h_actor_batch, grad_params, step, high_rng)
+        h_loss, h_info = self.high_actor_loss(
+            h_actor_batch, grad_params, step, high_rng
+        )
         for k, v in h_info.items():
             info[f"high_actor/{k}"] = v
 
@@ -682,7 +696,10 @@ class NE_with_warmup(flax.struct.PyTreeNode):
 
         if encoder_def is not None:
             network_info["encoder"] = (encoder_def, (ex_observations,))
-            network_info["target_encoder"] = (copy.deepcopy(encoder_def), (ex_observations,))
+            network_info["target_encoder"] = (
+                copy.deepcopy(encoder_def),
+                (ex_observations,),
+            )
 
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
@@ -751,6 +768,7 @@ def get_config():
             actor_p_randomgoal=0.0,
             actor_geom_sample=False,
             gc_negative=True,
+            p_aug=0.0,  # Probability of applying image augmentation.
             # Flow / AWR Params
             flow_steps=10,
             high_beta=3.0,
