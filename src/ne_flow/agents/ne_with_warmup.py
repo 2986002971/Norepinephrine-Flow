@@ -11,6 +11,7 @@ from ne_flow.flax_utils import ModuleDict, TrainState, nonpytree_field
 from ne_flow.models import (
     GCFlowActor,
     GCValue,
+    encoder_modules,
 )
 
 
@@ -288,23 +289,63 @@ class NE_with_warmup(flax.struct.PyTreeNode):
 
         info = {}
 
+        if self.config["encoder"] is not None:
+            # Encode visual observations (with gradients for V/Q)
+            z_s = self.network.select("encoder")(batch["observations"], train=True, params=grad_params)
+            z_g = self.network.select("encoder")(batch["value_goals"], train=True, params=grad_params)
+            
+            # Target Encoder for High Actor Flow matching
+            z_target = self.network.select("target_encoder")(batch["high_actor_targets"], train=False)
+            z_target = jax.lax.stop_gradient(z_target)
+            
+            # Additional encoded inputs for actors (frozen)
+            z_s_sg = jax.lax.stop_gradient(z_s)
+            
+            z_high_actor_goals = self.network.select("encoder")(batch["high_actor_goals"], train=True, params=grad_params)
+            z_high_actor_goals_sg = jax.lax.stop_gradient(z_high_actor_goals)
+            
+            z_low_actor_goals = self.network.select("encoder")(batch["low_actor_goals"], train=True, params=grad_params)
+            z_low_actor_goals_sg = jax.lax.stop_gradient(z_low_actor_goals)
+            
+            z_next_obs = self.network.select("encoder")(batch["next_observations"], train=True, params=grad_params)
+            z_next_obs_sg = jax.lax.stop_gradient(z_next_obs)
+            
+            # Construct latent batches
+            v_c_batch = batch.copy()
+            v_c_batch["observations"] = z_s
+            v_c_batch["value_goals"] = z_g
+            v_c_batch["next_observations"] = z_next_obs_sg
+            
+            h_actor_batch = batch.copy()
+            h_actor_batch["observations"] = z_s_sg
+            h_actor_batch["high_actor_goals"] = z_high_actor_goals_sg
+            h_actor_batch["high_actor_targets"] = z_target
+            
+            l_actor_batch = batch.copy()
+            l_actor_batch["observations"] = z_s_sg
+            l_actor_batch["low_actor_goals"] = z_low_actor_goals_sg
+        else:
+            v_c_batch = batch
+            h_actor_batch = batch
+            l_actor_batch = batch
+
         # Value Update
-        v_loss, v_info = self.value_loss(batch, grad_params)
+        v_loss, v_info = self.value_loss(v_c_batch, grad_params)
         for k, v in v_info.items():
             info[f"value/{k}"] = v
 
         # Critic Update
-        c_loss, c_info = self.critic_loss(batch, grad_params)
+        c_loss, c_info = self.critic_loss(v_c_batch, grad_params)
         for k, v in c_info.items():
             info[f"critic/{k}"] = v
 
         # High Actor Update
-        h_loss, h_info = self.high_actor_loss(batch, grad_params, step, high_rng)
+        h_loss, h_info = self.high_actor_loss(h_actor_batch, grad_params, step, high_rng)
         for k, v in h_info.items():
             info[f"high_actor/{k}"] = v
 
         # Low Actor Update
-        l_loss, l_info = self.low_actor_loss(batch, grad_params, step, low_rng)
+        l_loss, l_info = self.low_actor_loss(l_actor_batch, grad_params, step, low_rng)
         for k, v in l_info.items():
             info[f"low_actor/{k}"] = v
 
@@ -329,6 +370,8 @@ class NE_with_warmup(flax.struct.PyTreeNode):
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, "critic")
+        if self.config["encoder"] is not None:
+            self.target_update(new_network, "encoder")
         return self.replace(network=new_network, rng=new_rng), info
 
     # --- 4. Stateful Inference Interface ---
@@ -480,6 +523,10 @@ class NE_with_warmup(flax.struct.PyTreeNode):
         Sample subgoals using Best-of-N.
         Returns: [B, subgoal_dim]
         """
+        if self.config["encoder"] is not None:
+            observations = self.network.select("encoder")(observations, train=False)
+            goals = self.network.select("encoder")(goals, train=False)
+
         rng = rng if rng is not None else self.rng
         rng, high_rng = jax.random.split(rng)
 
@@ -519,6 +566,9 @@ class NE_with_warmup(flax.struct.PyTreeNode):
         Sample action chunks using Best-of-N.
         Returns: [B, H*A]
         """
+        if self.config["encoder"] is not None:
+            observations = self.network.select("encoder")(observations, train=False)
+
         rng = rng if rng is not None else self.rng
         rng, low_rng = jax.random.split(rng)
 
@@ -560,7 +610,14 @@ class NE_with_warmup(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng)
 
-        obs_dim = ex_observations.shape[-1]
+        if config["encoder"] is not None:
+            encoder_module = encoder_modules[config["encoder"]]
+            encoder_def = encoder_module()
+            obs_dim = 512  # Assuming default impala MLP hidden dim
+        else:
+            encoder_def = None
+            obs_dim = ex_observations.shape[-1]
+
         action_dim = ex_actions.shape[-1]
         # Action Chunk dim
         full_action_dim = action_dim * (
@@ -568,8 +625,15 @@ class NE_with_warmup(flax.struct.PyTreeNode):
         )
 
         # Placeholders for initialization
-        ex_goals = ex_observations
-        ex_subgoals = ex_observations
+        if encoder_def is not None:
+            ex_obs_latent = jnp.zeros((1, obs_dim))
+            ex_goals_latent = jnp.zeros((1, obs_dim))
+            ex_subgoals_latent = jnp.zeros((1, obs_dim))
+        else:
+            ex_obs_latent = ex_observations
+            ex_goals_latent = ex_observations
+            ex_subgoals_latent = ex_observations
+
         ex_full_actions = jnp.zeros((1, full_action_dim))
         ex_time = jnp.zeros((1, 1))
 
@@ -600,21 +664,25 @@ class NE_with_warmup(flax.struct.PyTreeNode):
         )
 
         network_info = dict(
-            value=(value_def, (ex_observations, ex_goals)),
-            critic=(critic_def, (ex_observations, ex_goals, ex_full_actions)),
+            value=(value_def, (ex_obs_latent, ex_goals_latent)),
+            critic=(critic_def, (ex_obs_latent, ex_goals_latent, ex_full_actions)),
             target_critic=(
                 copy.deepcopy(critic_def),
-                (ex_observations, ex_goals, ex_full_actions),
+                (ex_obs_latent, ex_goals_latent, ex_full_actions),
             ),
             high_actor=(
                 high_actor_def,
-                (ex_observations, ex_goals, ex_subgoals, ex_time),
+                (ex_obs_latent, ex_goals_latent, ex_subgoals_latent, ex_time),
             ),
             low_actor=(
                 low_actor_def,
-                (ex_observations, ex_subgoals, ex_full_actions, ex_time),
+                (ex_obs_latent, ex_subgoals_latent, ex_full_actions, ex_time),
             ),
         )
+
+        if encoder_def is not None:
+            network_info["encoder"] = (encoder_def, (ex_observations,))
+            network_info["target_encoder"] = (copy.deepcopy(encoder_def), (ex_observations,))
 
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
@@ -626,6 +694,8 @@ class NE_with_warmup(flax.struct.PyTreeNode):
 
         params = network.params
         params["modules_target_critic"] = params["modules_critic"]
+        if encoder_def is not None:
+            params["modules_target_encoder"] = params["modules_encoder"]
 
         # Store dimensions for inference buffer initialization
         config["obs_dim"] = obs_dim
