@@ -111,12 +111,12 @@ class NE_without_high(flax.struct.PyTreeNode):
         actions = batch["actions"]
 
         if self.config["action_chunking"]:
-            discount = self.config["discount"] ** self.config["horizon_length"]
+            discount = self.config["discount"] ** self.config["low_chunk_length"]
             # Rewards summed over horizon
             rewards = jnp.sum(
                 batch["rewards"]
                 * (
-                    self.config["discount"] ** jnp.arange(self.config["horizon_length"])
+                    self.config["discount"] ** jnp.arange(self.config["low_chunk_length"])
                 ),
                 axis=1,
             )
@@ -173,7 +173,7 @@ class NE_without_high(flax.struct.PyTreeNode):
         adv = q - v  # [B]
 
         # 2. AWR weights
-        weights = jnp.exp(adv * self.config["awr_temp"])
+        weights = jnp.exp(adv * self.config["beta"])
         weights = jnp.clip(weights, max=100.0)
         weights = jax.lax.stop_gradient(weights)  # [B]
 
@@ -272,12 +272,12 @@ class NE_without_high(flax.struct.PyTreeNode):
                 not jnp.allclose(goal, prev_goal)
             )
             if goal_changed:
-                state["chunk_step_idx"] = self.config["horizon_length"]  # Force replan
+                state["chunk_step_idx"] = self.config["low_chunk_length"]  # Force replan
 
         state["prev_goal"] = goal
 
         # Replanning
-        if state.get("chunk_step_idx", 999) >= self.config["horizon_length"]:
+        if state.get("chunk_step_idx", 999) >= self.config["low_chunk_length"]:
             # Sample: Returns [1, H, A]
             action_chunk = self.sample_low_actions(obs, goal, seed)
             state["action_chunk_buffer"] = action_chunk
@@ -339,7 +339,7 @@ class NE_without_high(flax.struct.PyTreeNode):
         Returns: [B, H, A] (Structured Action Chunk)
         """
         N = self.config["low_num_samples"]
-        horizon = self.config["horizon_length"]
+        horizon = self.config["low_chunk_length"]
         action_dim = self.config["action_dim"]
 
         # 1. Get Candidates: [B, N, H, A]
@@ -381,7 +381,7 @@ class NE_without_high(flax.struct.PyTreeNode):
 
         action_dim = ex_actions.shape[-1]
         obs_dim = ex_observations.shape[-1]
-        horizon = config["horizon_length"] if config["action_chunking"] else 1
+        horizon = config["low_chunk_length"] if config["action_chunking"] else 1
 
         ex_goals = ex_observations
 
@@ -495,10 +495,10 @@ def get_config():
             gc_negative=True,  # Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as reward.
             # Flow / AWR Params
             flow_steps=10,  # ODE Integration steps
-            awr_temp=3.0,  # AWR 温度 (越大区分度越高，但也越不稳定)
+            beta=3.0,  # AWR 温度 (越大区分度越高，但也越不稳定)
             # Chunking Params
             action_chunking=True,
-            horizon_length=8,  # Chunk size
+            low_chunk_length=8,  # Chunk size
             # Inference Params (Best-of-N)
             low_num_samples=32,  # Samples for action chunk
             # Misc

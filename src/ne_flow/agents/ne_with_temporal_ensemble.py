@@ -108,12 +108,12 @@ class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
         """
         if self.config["action_chunking"]:
             actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
-            discount = self.config["discount"] ** self.config["horizon_length"]
+            discount = self.config["discount"] ** self.config["low_chunk_length"]
             # Rewards are summed here if batch has time dim
             rewards = jnp.sum(
                 batch["rewards"]
                 * (
-                    self.config["discount"] ** jnp.arange(self.config["horizon_length"])
+                    self.config["discount"] ** jnp.arange(self.config["low_chunk_length"])
                 ),
                 axis=1,
             )
@@ -167,7 +167,7 @@ class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
         adv = v_next - v_curr
 
         # 2. Calculate AWR Weights
-        weights = jnp.exp(adv * self.config["high_awr_temp"])
+        weights = jnp.exp(adv * self.config["high_beta"])
         weights = jnp.clip(weights, max=100.0)
         weights = jax.lax.stop_gradient(weights)
 
@@ -215,7 +215,7 @@ class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
         adv = q - v
 
         # 2. Calculate AWR Weights [B]
-        weights = jnp.exp(adv * self.config["low_awr_temp"])
+        weights = jnp.exp(adv * self.config["low_beta"])
         weights = jnp.clip(weights, max=100.0)
         weights = jax.lax.stop_gradient(weights)
 
@@ -338,7 +338,7 @@ class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
             new_state = self.reset_inference_state(
                 self.config["obs_dim"],
                 self.config["action_dim"],
-                self.config["horizon_length"],
+                self.config["low_chunk_length"],
             )
             self._state.update(new_state)
 
@@ -354,7 +354,7 @@ class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
                 new_state = self.reset_inference_state(
                     self.config["obs_dim"],
                     self.config["action_dim"],
-                    self.config["horizon_length"],
+                    self.config["low_chunk_length"],
                 )
                 self._state.clear()
                 self._state.update(new_state)
@@ -363,9 +363,9 @@ class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
         state["prev_goal"] = goal
 
         # ===== 2. High-Level Policy (Subgoal) =====
-        traj_horizon = self.config["horizon_length"]
-        subgoal_horizon = self.config["subgoal_horizon"]
-        update_subgoal = (state["high_step_counter"] % subgoal_horizon) == 0
+        traj_horizon = self.config["low_chunk_length"]
+        subgoal_replan_interval = self.config["subgoal_replan_interval"]
+        update_subgoal = (state["high_step_counter"] % subgoal_replan_interval) == 0
 
         rng, high_rng, low_rng = jax.random.split(seed, 3)
 
@@ -567,7 +567,7 @@ class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
 
         N = self.config["low_num_samples"]
         K = self.config.get("low_top_k", 4)
-        action_dim = self.config["action_dim"] * self.config["horizon_length"]
+        action_dim = self.config["action_dim"] * self.config["low_chunk_length"]
 
         candidate_actions = self.sample_flow_actions(
             "low_actor", observations, subgoals, action_dim, N, low_rng
@@ -607,7 +607,7 @@ class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
         action_dim = ex_actions.shape[-1]
         # Action Chunk dim
         full_action_dim = action_dim * (
-            config["horizon_length"] if config["action_chunking"] else 1
+            config["low_chunk_length"] if config["action_chunking"] else 1
         )
 
         # Placeholders for initialization
@@ -675,7 +675,7 @@ class NE_with_temporal_ensemble_Agent(flax.struct.PyTreeNode):
         config["action_dim"] = action_dim  # Raw action dim
 
         # Initialize stateful inference buffers in a mutable dict
-        horizon = config["horizon_length"]
+        horizon = config["low_chunk_length"]
         batch_size = 1  # Single environment assumption
 
         inference_state = {
@@ -710,6 +710,7 @@ def get_config():
             expectile=0.9,
             # Hierarchical Params
             subgoal_steps=25,
+            subgoal_replan_interval=8,
             low_top_k=1,
             high_top_k=2,
             discrete=False,  # unused
@@ -726,13 +727,12 @@ def get_config():
             gc_negative=True,
             # Flow / AWR Params
             flow_steps=10,
-            high_awr_temp=3.0,
-            low_awr_temp=3.0,
+            high_beta=3.0,
+            low_beta=3.0,
             # Chunking Params
             action_chunking=True,
-            horizon_length=8,
+            low_chunk_length=8,
             temporal_decay=0.1,
-            subgoal_horizon=8,
             # Inference Params
             high_num_samples=32,
             low_num_samples=32,
