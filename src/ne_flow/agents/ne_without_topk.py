@@ -527,7 +527,7 @@ def get_config():
             low_awr_temp=3.0,
             # Chunking Params
             action_chunking=True,
-            horizon_length=8,
+            horizon_length=4,
             subgoal_horizon=4,
             low_actor_update_interval=4,
             # Inference Params
